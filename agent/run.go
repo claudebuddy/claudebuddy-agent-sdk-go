@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/costtracker"
+	"github.com/claudebuddy/claudebuddy-agent-sdk-go/hooks"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/types"
 )
 
@@ -130,6 +131,17 @@ func (r *Run) emit(event types.SDKMessage) error {
 // publishes exactly one authoritative terminal event before closing channels.
 func (r *Run) complete(err error) {
 	r.finishOnce.Do(func() {
+		var errorMessages []string
+		if err != nil {
+			errorMessages = append(errorMessages, err.Error())
+		}
+		cleanupCtx, cancel := hookCleanupContext(r.ctx)
+		stop, hookErr := r.session.runtime.hookManager.RunStop(cleanupCtx)
+		cancel()
+		if outcomeErr := hookOutcomeError(hooks.HookStop, stop, hookErr); outcomeErr != nil {
+			errorMessages = append(errorMessages, outcomeErr.Error())
+			err = errors.Join(err, outcomeErr)
+		}
 		snapshot := r.ledger.Snapshot()
 		r.result.Duration = time.Since(r.started)
 		r.result.Messages = r.session.GetMessages()
@@ -137,9 +149,7 @@ func (r *Run) complete(err error) {
 		r.result.ModelUsage = snapshot.ModelUsage
 		r.result.Cost = snapshot.Cost
 		r.result.Subtype, r.result.IsError = resultStatus(err)
-		if err != nil {
-			r.result.Errors = []string{err.Error()}
-		}
+		r.result.Errors = errorMessages
 		r.err = err
 		terminalUsage := r.result.Usage
 		terminal := types.SDKMessage{
@@ -175,6 +185,27 @@ func (r *Run) complete(err error) {
 		close(r.done)
 		s.runMu.Unlock()
 	})
+}
+
+func hookOutcomeError(event hooks.HookEvent, result *hooks.HookResult, err error) error {
+	if err != nil {
+		return fmt.Errorf("%s hook: %w", event, err)
+	}
+	if result != nil && result.Blocked {
+		reason := result.Message
+		if reason == "" {
+			reason = "blocked"
+		}
+		return fmt.Errorf("%s hook: %s", event, reason)
+	}
+	return nil
+}
+
+func hookCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil || ctx.Err() != nil {
+		return context.WithTimeout(context.Background(), 2*time.Second)
+	}
+	return context.WithTimeout(ctx, 2*time.Second)
 }
 
 func resultStatus(err error) (types.ResultSubtype, bool) {

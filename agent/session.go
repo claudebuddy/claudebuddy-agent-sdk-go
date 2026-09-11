@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/costtracker"
+	"github.com/claudebuddy/claudebuddy-agent-sdk-go/hooks"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/tools"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/types"
 	"github.com/google/uuid"
@@ -34,6 +35,9 @@ type Session struct {
 	closed      bool
 	registry    *tools.Registry
 	costTracker *costtracker.Tracker
+	endOnce     sync.Once
+	startDone   chan struct{}
+	startOK     bool
 }
 
 // NewSession creates a conversation with fresh built-in state. Empty IDs are
@@ -49,22 +53,44 @@ func (a *Agent) newSession(opts SessionOptions) (*Session, error) {
 	if opts.ID == "" {
 		opts.ID = uuid.New().String()
 	}
-	s := &Session{runtime: a, id: opts.ID, messages: cloneMessages(opts.History), costTracker: costtracker.NewTracker(opts.ID)}
+	s := &Session{runtime: a, id: opts.ID, messages: cloneMessages(opts.History), costTracker: costtracker.NewTracker(opts.ID), startDone: make(chan struct{})}
 	// Assembly calls custom tool metadata, so it must happen outside runtime locks.
 	s.registry = a.newRegistry(s)
 	a.sessionsMu.Lock()
-	defer a.sessionsMu.Unlock()
 	if a.closed.Load() {
+		a.sessionsMu.Unlock()
 		return nil, ErrAgentClosed
 	}
 	if _, exists := a.sessions[s.id]; exists {
+		a.sessionsMu.Unlock()
 		return nil, fmt.Errorf("%w: session ID %q already exists", ErrInvalidOptions, s.id)
 	}
 	for _, tool := range a.mcpTools {
 		s.registry.RegisterNamed(tool.name, tool.tool)
 	}
 	a.sessions[s.id] = s
-	// SessionStart lifecycle integration attaches after registration in Task 6.
+	a.sessionsMu.Unlock()
+	start, err := a.hookManager.RunSessionStart(a.lifetime, s.id)
+	if hookErr := hookOutcomeError(hooks.HookSessionStart, start, err); hookErr != nil {
+		a.sessionsMu.Lock()
+		if a.sessions[s.id] == s {
+			delete(a.sessions, s.id)
+		}
+		a.sessionsMu.Unlock()
+		s.runMu.Lock()
+		s.closed = true
+		s.runMu.Unlock()
+		close(s.startDone)
+		return s, hookErr
+	}
+	s.runMu.Lock()
+	s.startOK = true
+	closed := s.closed
+	s.runMu.Unlock()
+	close(s.startDone)
+	if closed || a.closed.Load() {
+		return s, ErrAgentClosed
+	}
 	return s, nil
 }
 
@@ -214,7 +240,15 @@ func (s *Session) Close() {
 	if r := s.requestClose(); r != nil {
 		<-r.done
 	}
-	// SessionEnd attaches here in Task 6.
+	<-s.startDone
+	if !s.startOK {
+		return
+	}
+	s.endOnce.Do(func() {
+		ctx, cancel := hookCleanupContext(s.runtime.lifetime)
+		defer cancel()
+		_, _ = s.runtime.hookManager.RunSessionEnd(ctx, s.id)
+	})
 }
 
 func cloneMessages(messages []types.Message) []types.Message {

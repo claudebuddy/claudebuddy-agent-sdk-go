@@ -12,6 +12,7 @@ import (
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/api"
 	agentcontext "github.com/claudebuddy/claudebuddy-agent-sdk-go/context"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/costtracker"
+	"github.com/claudebuddy/claudebuddy-agent-sdk-go/hooks"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/permissions"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/tools"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/types"
@@ -26,6 +27,15 @@ func (r *Run) runLoop(prompt string) error {
 	ctx := r.ctx
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	promptHook, err := a.hookManager.RunUserPromptSubmit(ctx, prompt)
+	if hookErr := hookOutcomeError(hooks.HookUserPromptSubmit, promptHook, err); hookErr != nil {
+		return hookErr
+	}
+	if promptHook.Output != nil && promptHook.Output.UpdatedInput != nil {
+		if updated, ok := promptHook.Output.UpdatedInput["prompt"].(string); ok {
+			prompt = updated
+		}
 	}
 	// Build system prompt
 	systemPrompt := a.opts.SystemPrompt
@@ -86,7 +96,7 @@ func (r *Run) runLoop(prompt string) error {
 	}
 
 	// Create tool executor
-	executor := tools.NewExecutorWithOptions(tools.ExecutorOptions{Registry: s.registry, CanUseTool: a.canUseTool, ToolContext: toolCtx, MaxConcurrency: a.opts.MaxConcurrentTools})
+	executor := tools.NewExecutorWithOptions(tools.ExecutorOptions{Registry: s.registry, CanUseTool: a.permissionPolicy(ctx), RecheckTool: a.permissionBoundsPolicy(), ToolContext: toolCtx, MaxConcurrency: a.opts.MaxConcurrentTools, Hooks: a.hookManager})
 
 	turn := 0
 
@@ -183,6 +193,10 @@ func (r *Run) runLoop(prompt string) error {
 			usedModel = fallbackReq.Model
 		} else if streamError != nil {
 			return fmt.Errorf("API stream error: %w", streamError)
+		}
+		postSampling, err := a.hookManager.RunPostSampling(ctx)
+		if hookErr := hookOutcomeError(hooks.HookPostSampling, postSampling, err); hookErr != nil {
+			return hookErr
 		}
 
 		// Update usage

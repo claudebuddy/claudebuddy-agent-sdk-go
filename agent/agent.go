@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -188,23 +189,23 @@ type BudgetOptions struct {
 
 // Agent is the main agent that runs the agentic loop.
 type Agent struct {
-	opts           Options
-	provider       api.MessageProvider
-	initErr        error
-	mcpClient      *mcp.Client
-	hookManager    *hooks.Manager
-	canUseTool     types.CanUseToolFn
-	sessionsMu     sync.RWMutex
-	sessions       map[string]*Session
-	defaultSession *Session
-	runSlots       chan struct{}
-	closed         atomic.Bool
-	closeOnce      sync.Once
-	lifetime       context.Context
-	cancel         context.CancelFunc
-	initWG         sync.WaitGroup
-	initSlot       chan struct{}
-	mcpTools       []namedTool
+	opts             Options
+	provider         api.MessageProvider
+	initErr          error
+	mcpClient        *mcp.Client
+	hookManager      *hooks.Manager
+	permissionConfig *permissions.Config
+	sessionsMu       sync.RWMutex
+	sessions         map[string]*Session
+	defaultSession   *Session
+	runSlots         chan struct{}
+	closed           atomic.Bool
+	closeOnce        sync.Once
+	lifetime         context.Context
+	cancel           context.CancelFunc
+	initWG           sync.WaitGroup
+	initSlot         chan struct{}
+	mcpTools         []namedTool
 }
 
 type namedTool struct {
@@ -255,24 +256,65 @@ func New(opts Options) *Agent {
 	if permConfig.Mode == "" {
 		permConfig.Mode = types.PermissionModeBypassPermissions
 	}
-	canUseTool := permissions.NewPolicy(permConfig, opts.AllowedTools, opts.DisallowedTools, opts.CanUseTool)
-
 	hookManager := hooks.NewManager(opts.Hooks)
 
 	lifetime, cancel := context.WithCancel(context.Background())
 	a := &Agent{
-		opts:        opts,
-		provider:    provider,
-		initErr:     initErr,
-		mcpClient:   mcp.NewClient(),
-		hookManager: hookManager,
-		canUseTool:  canUseTool,
-		sessions:    make(map[string]*Session),
-		runSlots:    make(chan struct{}, opts.MaxConcurrentRuns),
-		lifetime:    lifetime, cancel: cancel, initSlot: make(chan struct{}, 1),
+		opts:             opts,
+		provider:         provider,
+		initErr:          initErr,
+		mcpClient:        mcp.NewClient(),
+		hookManager:      hookManager,
+		permissionConfig: permConfig,
+		sessions:         make(map[string]*Session),
+		runSlots:         make(chan struct{}, opts.MaxConcurrentRuns),
+		lifetime:         lifetime, cancel: cancel, initSlot: make(chan struct{}, 1),
 	}
-	a.defaultSession, _ = a.newSession(SessionOptions{})
+	var defaultErr error
+	a.defaultSession, defaultErr = a.newSession(SessionOptions{})
+	if defaultErr != nil && a.initErr == nil {
+		a.initErr = defaultErr
+	}
 	return a
+}
+
+func (a *Agent) permissionPolicy(ctx context.Context) types.CanUseToolFn {
+	callback := a.opts.CanUseTool
+	if callback != nil {
+		hostCallback := callback
+		callback = func(tool types.Tool, input map[string]interface{}) (*types.PermissionDecision, error) {
+			result, err := a.hookManager.RunPermissionRequest(ctx, tool.Name(), input)
+			if err != nil {
+				return nil, err
+			}
+			if result.Blocked {
+				reason := result.Message
+				if reason == "" {
+					reason = "Blocked by PermissionRequest hook"
+				}
+				return &types.PermissionDecision{Behavior: types.PermissionDeny, Reason: reason}, nil
+			}
+			checkedInput := input
+			hookUpdated := false
+			if result.Output != nil && result.Output.UpdatedInput != nil {
+				checkedInput = result.Output.UpdatedInput
+				hookUpdated = true
+			}
+			decision, err := hostCallback(tool, checkedInput)
+			if decision != nil && decision.UpdatedInput == nil && hookUpdated {
+				decision.UpdatedInput = checkedInput
+			}
+			return decision, err
+		}
+	}
+	return permissions.NewPolicy(a.permissionConfig, a.opts.AllowedTools, a.opts.DisallowedTools, callback)
+}
+
+func (a *Agent) permissionBoundsPolicy() types.CanUseToolFn {
+	return permissions.NewPolicy(a.permissionConfig, a.opts.AllowedTools, a.opts.DisallowedTools,
+		func(types.Tool, map[string]interface{}) (*types.PermissionDecision, error) {
+			return &types.PermissionDecision{Behavior: types.PermissionAllow}, nil
+		})
 }
 
 func (a *Agent) newRegistry(s *Session) *tools.Registry {
@@ -378,6 +420,14 @@ type QueryResult struct {
 
 // Query runs the agentic loop with streaming events.
 func (a *Agent) Query(ctx context.Context, prompt string) (<-chan types.SDKMessage, <-chan error) {
+	if a.initErr != nil {
+		events := make(chan types.SDKMessage)
+		errs := make(chan error, 1)
+		errs <- a.initErr
+		close(events)
+		close(errs)
+		return events, errs
+	}
 	return a.defaultSession.Query(ctx, prompt)
 }
 
@@ -414,6 +464,9 @@ func validatePermissionMode(mode types.PermissionMode) error {
 
 // Prompt runs a query and returns the final result (blocking).
 func (a *Agent) Prompt(ctx context.Context, prompt string) (*QueryResult, error) {
+	if a.initErr != nil {
+		return nil, a.initErr
+	}
 	return a.defaultSession.Prompt(ctx, prompt)
 }
 
@@ -455,7 +508,19 @@ func (a *Agent) spawnSubagent(ctx context.Context, config tools.SubagentConfig) 
 	return a.spawnSubagentWithTracker(ctx, config, a.defaultSession.costTracker)
 }
 
-func (a *Agent) spawnSubagentWithTracker(ctx context.Context, config tools.SubagentConfig, tracker *costtracker.Tracker) (string, error) {
+func (a *Agent) spawnSubagentWithTracker(ctx context.Context, config tools.SubagentConfig, tracker *costtracker.Tracker) (text string, retErr error) {
+	start, err := a.hookManager.RunSubagentStart(ctx, config.Name)
+	if hookErr := hookOutcomeError(hooks.HookSubagentStart, start, err); hookErr != nil {
+		return "", hookErr
+	}
+	defer func() {
+		cleanupCtx, cancel := hookCleanupContext(ctx)
+		defer cancel()
+		stop, err := a.hookManager.RunSubagentStop(cleanupCtx, config.Name)
+		if hookErr := hookOutcomeError(hooks.HookSubagentStop, stop, err); hookErr != nil {
+			retErr = errors.Join(retErr, hookErr)
+		}
+	}()
 	model := config.Model
 	if model == "" {
 		model = a.opts.Model
