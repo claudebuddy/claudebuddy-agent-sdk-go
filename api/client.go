@@ -70,7 +70,8 @@ type ClientConfig struct {
 
 // Client communicates with the Messages API.
 type Client struct {
-	config ClientConfig
+	config            ClientConfig
+	maxTokensExplicit bool
 }
 
 var _ MessageProvider = (*Client)(nil)
@@ -88,6 +89,7 @@ func envOr(keys ...string) string {
 
 // NewClient creates an API client.
 func NewClient(config ClientConfig) *Client {
+	maxTokensExplicit := config.MaxTokens != 0
 	if config.APIKey == "" {
 		config.APIKey = envOr("CLAUDEBUDDY_API_KEY", "ANTHROPIC_API_KEY")
 	}
@@ -161,7 +163,7 @@ func NewClient(config ClientConfig) *Client {
 		}
 	}
 
-	return &Client{config: config}
+	return &Client{config: config, maxTokensExplicit: maxTokensExplicit}
 }
 
 // Model returns the current model name.
@@ -172,8 +174,24 @@ func (c *Client) Model() string {
 // SetModel changes the model used for subsequent requests.
 func (c *Client) SetModel(model string) {
 	c.config.Model = model
-	cfg := GetModelConfig(model)
-	c.config.MaxTokens = cfg.MaxOutputTokens
+	if !c.maxTokensExplicit {
+		cfg := GetModelConfig(model)
+		c.config.MaxTokens = cfg.MaxOutputTokens
+	}
+}
+
+func (c *Client) applyRequestDefaults(req *MessagesRequest) {
+	if req.Model == "" {
+		req.Model = c.config.Model
+	}
+	if req.MaxTokens != 0 {
+		return
+	}
+	if c.maxTokensExplicit {
+		req.MaxTokens = c.config.MaxTokens
+		return
+	}
+	req.MaxTokens = GetModelConfig(req.Model).MaxOutputTokens
 }
 
 // APIMessage is a message sent to the API.
@@ -336,12 +354,7 @@ func (c *Client) CreateMessageStream(ctx context.Context, req MessagesRequest) (
 		defer close(errCh)
 
 		req.Stream = true
-		if req.Model == "" {
-			req.Model = c.config.Model
-		}
-		if req.MaxTokens == 0 {
-			req.MaxTokens = c.config.MaxTokens
-		}
+		c.applyRequestDefaults(&req)
 
 		// Route to OpenAI adapter if needed
 		if c.config.Provider == ProviderOpenAI {
@@ -458,12 +471,7 @@ func (c *Client) CreateMessageStream(ctx context.Context, req MessagesRequest) (
 // CreateMessage sends a non-streaming messages request.
 func (c *Client) CreateMessage(ctx context.Context, req MessagesRequest) (*StreamMessage, error) {
 	req.Stream = false
-	if req.Model == "" {
-		req.Model = c.config.Model
-	}
-	if req.MaxTokens == 0 {
-		req.MaxTokens = c.config.MaxTokens
-	}
+	c.applyRequestDefaults(&req)
 
 	// Route to OpenAI adapter if needed
 	if c.config.Provider == ProviderOpenAI {
