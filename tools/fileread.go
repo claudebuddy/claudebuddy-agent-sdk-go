@@ -166,14 +166,12 @@ func (t *FileReadTool) readText(filePath string, input map[string]interface{}, t
 	}
 
 	// Track file state for staleness detection
-	if tCtx != nil && tCtx.ReadFileState != nil {
-		tCtx.ReadFileState[filePath] = &types.FileReadState{
-			Content:   content,
-			Timestamp: time.Now().UnixMilli(),
-			Offset:    offset,
-			Limit:     limit,
-		}
-	}
+	tCtx.SetFileReadState(filePath, &types.FileReadState{
+		Content:   content,
+		Timestamp: time.Now().UnixMilli(),
+		Offset:    offset,
+		Limit:     limit,
+	})
 
 	result := sb.String()
 	if end < totalLines {

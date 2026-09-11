@@ -100,8 +100,8 @@ func (t *FileEditTool) Call(ctx context.Context, input map[string]interface{}, t
 	lineEnding := detectLineEnding(content)
 
 	// Staleness check
-	if tCtx != nil && tCtx.ReadFileState != nil {
-		if state, ok := tCtx.ReadFileState[filePath]; ok {
+	if tCtx != nil {
+		if state, ok := tCtx.GetFileReadState(filePath); ok {
 			if state.Content != content {
 				info, _ := os.Stat(filePath)
 				if info != nil {
@@ -161,12 +161,10 @@ func (t *FileEditTool) Call(ctx context.Context, input map[string]interface{}, t
 	}
 
 	// Update file state cache
-	if tCtx != nil && tCtx.ReadFileState != nil {
-		tCtx.ReadFileState[filePath] = &types.FileReadState{
-			Content:   newContent,
-			Timestamp: time.Now().UnixMilli(),
-		}
-	}
+	tCtx.SetFileReadState(filePath, &types.FileReadState{
+		Content:   newContent,
+		Timestamp: time.Now().UnixMilli(),
+	})
 
 	replacements := 1
 	if replaceAll {

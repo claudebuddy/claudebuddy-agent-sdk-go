@@ -11,17 +11,19 @@ import (
 type HookEvent string
 
 const (
-	HookPreToolUse        HookEvent = "PreToolUse"
-	HookPostToolUse       HookEvent = "PostToolUse"
+	HookPreToolUse         HookEvent = "PreToolUse"
+	HookPostToolUse        HookEvent = "PostToolUse"
 	HookPostToolUseFailure HookEvent = "PostToolUseFailure"
-	HookPostSampling      HookEvent = "PostSampling"
-	HookStop              HookEvent = "Stop"
-	HookUserPromptSubmit  HookEvent = "UserPromptSubmit"
-	HookSubagentStart     HookEvent = "SubagentStart"
-	HookSubagentStop      HookEvent = "SubagentStop"
-	HookPreCompact        HookEvent = "PreCompact"
-	HookNotification      HookEvent = "Notification"
-	HookPermissionRequest HookEvent = "PermissionRequest"
+	HookPostSampling       HookEvent = "PostSampling"
+	HookStop               HookEvent = "Stop"
+	HookUserPromptSubmit   HookEvent = "UserPromptSubmit"
+	HookSubagentStart      HookEvent = "SubagentStart"
+	HookSubagentStop       HookEvent = "SubagentStop"
+	HookPreCompact         HookEvent = "PreCompact"
+	HookNotification       HookEvent = "Notification"
+	HookPermissionRequest  HookEvent = "PermissionRequest"
+	HookSessionStart       HookEvent = "SessionStart"
+	HookSessionEnd         HookEvent = "SessionEnd"
 )
 
 // HookDecision represents the decision outcome from a hook.
@@ -54,6 +56,8 @@ type HookInput struct {
 	NotificationMessage string `json:"notificationMessage,omitempty"`
 	// PermissionTool is the tool requesting permission (for PermissionRequest).
 	PermissionTool string `json:"permissionTool,omitempty"`
+	// SessionID identifies the conversation for SessionStart and SessionEnd.
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 // HookOutput is the rich result from a HookFnEx hook.
@@ -105,6 +109,8 @@ type HookConfig struct {
 	PreCompact         []HookRule `json:"PreCompact,omitempty"`
 	Notification       []HookRule `json:"Notification,omitempty"`
 	PermissionRequest  []HookRule `json:"PermissionRequest,omitempty"`
+	SessionStart       []HookRule `json:"SessionStart,omitempty"`
+	SessionEnd         []HookRule `json:"SessionEnd,omitempty"`
 }
 
 // HookProgress represents progress from a hook execution.
@@ -201,6 +207,16 @@ func (m *Manager) RunPermissionRequest(ctx context.Context, toolName string, inp
 	return m.runHooks(ctx, HookPermissionRequest, m.config.PermissionRequest, toolName, input, hookInput)
 }
 
+func (m *Manager) RunSessionStart(ctx context.Context, sessionID string) (*HookResult, error) {
+	hookInput := &HookInput{Event: HookSessionStart, SessionID: sessionID}
+	return m.runHooks(ctx, HookSessionStart, m.config.SessionStart, "", nil, hookInput)
+}
+
+func (m *Manager) RunSessionEnd(ctx context.Context, sessionID string) (*HookResult, error) {
+	hookInput := &HookInput{Event: HookSessionEnd, SessionID: sessionID}
+	return m.runHooks(ctx, HookSessionEnd, m.config.SessionEnd, "", nil, hookInput)
+}
+
 func (m *Manager) runHooks(ctx context.Context, event HookEvent, rules []HookRule, toolName string, input map[string]interface{}, hookInput *HookInput) (*HookResult, error) {
 	result := &HookResult{}
 
@@ -209,68 +225,59 @@ func (m *Manager) runHooks(ctx context.Context, event HookEvent, rules []HookRul
 			continue
 		}
 
-		// Apply per-rule timeout if configured.
-		hookCtx := ctx
-		if rule.Timeout > 0 {
-			var cancel context.CancelFunc
-			hookCtx, cancel = context.WithTimeout(ctx, rule.Timeout)
-			defer cancel()
-		}
-
-		// Run legacy HookFn hooks.
-		for i, hook := range rule.Hooks {
-			progress := HookProgress{
-				Event:    event,
-				HookName: fmt.Sprintf("%s_hook_%d", rule.Matcher, i),
-				ToolName: toolName,
-			}
-
-			msg, err := hook(hookCtx, toolName, input)
-			if err != nil {
-				return nil, fmt.Errorf("hook error (%s): %w", progress.HookName, err)
-			}
-			if msg != "" {
-				progress.Blocked = true
-				progress.StatusMessage = msg
-				result.Blocked = true
-				result.Message = msg
-			}
-			result.Progress = append(result.Progress, progress)
-
-			if result.Blocked {
-				return result, nil
-			}
-		}
-
-		// Run extended HookFnEx hooks.
-		for i, hook := range rule.HooksEx {
-			progress := HookProgress{
-				Event:    event,
-				HookName: fmt.Sprintf("%s_hookex_%d", rule.Matcher, i),
-				ToolName: toolName,
-			}
-
-			output, err := hook(hookCtx, hookInput)
-			if err != nil {
-				return nil, fmt.Errorf("hook error (%s): %w", progress.HookName, err)
-			}
-			if output != nil {
-				result.Output = output
-				if output.Decision == HookDecisionBlock {
-					progress.Blocked = true
-					progress.StatusMessage = output.Reason
-					result.Blocked = true
-					result.Message = output.Reason
+		err := withRuleContext(ctx, rule.Timeout, func(hookCtx context.Context) error {
+			for i, hook := range rule.Hooks {
+				progress := HookProgress{Event: event, HookName: fmt.Sprintf("%s_hook_%d", rule.Matcher, i), ToolName: toolName}
+				msg, err := hook(hookCtx, toolName, input)
+				if err != nil {
+					return fmt.Errorf("hook error (%s): %w", progress.HookName, err)
+				}
+				if msg != "" {
+					progress.Blocked, progress.StatusMessage = true, msg
+					result.Blocked, result.Message = true, msg
+				}
+				result.Progress = append(result.Progress, progress)
+				if result.Blocked {
+					return nil
 				}
 			}
-			result.Progress = append(result.Progress, progress)
-
-			if result.Blocked {
-				return result, nil
+			for i, hook := range rule.HooksEx {
+				progress := HookProgress{Event: event, HookName: fmt.Sprintf("%s_hookex_%d", rule.Matcher, i), ToolName: toolName}
+				output, err := hook(hookCtx, hookInput)
+				if err != nil {
+					return fmt.Errorf("hook error (%s): %w", progress.HookName, err)
+				}
+				if output != nil {
+					result.Output = output
+					if output.Decision == HookDecisionBlock {
+						progress.Blocked, progress.StatusMessage = true, output.Reason
+						result.Blocked, result.Message = true, output.Reason
+					}
+				}
+				result.Progress = append(result.Progress, progress)
+				if result.Blocked {
+					return nil
+				}
 			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if result.Blocked {
+			return result, nil
 		}
 	}
 	return result, nil
+}
+
+func withRuleContext(ctx context.Context, timeout time.Duration, fn func(context.Context) error) error {
+	if timeout <= 0 {
+		return fn(ctx)
+	}
+	hookCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return fn(hookCtx)
 }
 
 // HasHooks returns true if any hooks are configured.
@@ -285,7 +292,9 @@ func (m *Manager) HasHooks() bool {
 		len(m.config.SubagentStop) > 0 ||
 		len(m.config.PreCompact) > 0 ||
 		len(m.config.Notification) > 0 ||
-		len(m.config.PermissionRequest) > 0
+		len(m.config.PermissionRequest) > 0 ||
+		len(m.config.SessionStart) > 0 ||
+		len(m.config.SessionEnd) > 0
 }
 
 // GetConfig returns the current hook configuration.

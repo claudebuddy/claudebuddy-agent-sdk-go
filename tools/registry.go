@@ -1,11 +1,14 @@
 package tools
 
 import (
+	"sync"
+
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/types"
 )
 
 // Registry manages available tools.
 type Registry struct {
+	mu    sync.RWMutex
 	tools map[string]types.Tool
 }
 
@@ -18,16 +21,28 @@ func NewRegistry() *Registry {
 
 // Register adds a tool to the registry.
 func (r *Registry) Register(tool types.Tool) {
-	r.tools[tool.Name()] = tool
+	r.RegisterNamed(tool.Name(), tool)
+}
+
+// RegisterNamed installs a reference with an already resolved name. It lets
+// runtime owners publish tools under their map locks without invoking metadata.
+func (r *Registry) RegisterNamed(name string, tool types.Tool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tools[name] = tool
 }
 
 // Get returns a tool by name, or nil if not found.
 func (r *Registry) Get(name string) types.Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.tools[name]
 }
 
 // All returns all registered tools.
 func (r *Registry) All() []types.Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	result := make([]types.Tool, 0, len(r.tools))
 	for _, t := range r.tools {
 		result = append(result, t)
@@ -37,6 +52,8 @@ func (r *Registry) All() []types.Tool {
 
 // Names returns all registered tool names.
 func (r *Registry) Names() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.tools))
 	for name := range r.tools {
 		names = append(names, name)
@@ -47,7 +64,7 @@ func (r *Registry) Names() []string {
 // Filter returns tools matching a filter function.
 func (r *Registry) Filter(fn func(types.Tool) bool) []types.Tool {
 	var result []types.Tool
-	for _, t := range r.tools {
+	for _, t := range r.All() {
 		if fn(t) {
 			result = append(result, t)
 		}

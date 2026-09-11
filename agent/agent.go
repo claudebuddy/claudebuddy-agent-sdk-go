@@ -2,11 +2,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"os"
+	"reflect"
+	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
 
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/api"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/costtracker"
@@ -18,7 +21,9 @@ import (
 )
 
 const (
-	defaultMaxTurns = 100
+	defaultMaxTurns           = 10
+	defaultMaxConcurrentRuns  = 32
+	defaultMaxConcurrentTools = 10
 )
 
 // ThinkingType represents the type of thinking configuration.
@@ -53,6 +58,10 @@ const (
 
 // Options configures an Agent.
 type Options struct {
+	// ProviderClient overrides the default API client. It is shared across
+	// Sessions and must support concurrent calls and context cancellation.
+	ProviderClient api.MessageProvider
+
 	// Model ID (e.g. "sonnet-4-6")
 	Model string
 
@@ -77,8 +86,21 @@ type Options struct {
 	// Maximum agentic turns per query
 	MaxTurns int
 
+	// Non-positive concurrency limits use defaults of 32 Runs and 10 tools.
+	MaxConcurrentRuns  int
+	MaxConcurrentTools int
+
 	// Maximum USD budget per query
 	MaxBudgetUSD float64
+
+	// Budget is the preferred Run budget. A non-nil zero value prevents the
+	// first model admission; MaxBudgetUSD remains a positive-only compatibility
+	// field and is ignored when Budget is present.
+	Budget *BudgetOptions
+
+	// sharedLedger is set only for child Agents so their model calls charge the
+	// owning parent Run. It is deliberately not part of the public contract.
+	sharedLedger *costtracker.Ledger
 
 	// Permission mode
 	PermissionMode types.PermissionMode
@@ -86,16 +108,20 @@ type Options struct {
 	// Tool names to pre-approve
 	AllowedTools []string
 
-	// Permission handler callback
+	// Permission handler callback. It may be called concurrently by Sessions
+	// and by safe parallel tools; implementations must synchronize shared state.
 	CanUseTool types.CanUseToolFn
 
 	// MCP server configurations
 	MCPServers map[string]types.MCPServerConfig
 
-	// Custom tools to add
+	// Custom tools to add. References are shared across Sessions; implementations
+	// must support concurrent use across Sessions even when IsConcurrencySafe
+	// restricts scheduling within one Run. Use separate Agents for unsafe instances.
 	CustomTools []types.Tool
 
-	// Hook configuration
+	// Hook configuration. Callback references are shared across Sessions and
+	// must synchronize their own mutable state when lifecycle hooks are enabled.
 	Hooks hooks.HookConfig
 
 	// Environment variables (for API key, model, etc.)
@@ -155,60 +181,150 @@ type AgentDefinition struct {
 	InitialPrompt   string                           `json:"initialPrompt,omitempty"`
 }
 
+// BudgetOptions configures a hard admission threshold for approximate cost.
+// Concurrent in-flight requests may overshoot an estimate.
+type BudgetOptions struct {
+	MaxUSD float64 `json:"max_usd"`
+}
+
 // Agent is the main agent that runs the agentic loop.
 type Agent struct {
-	opts         Options
-	apiClient    *api.Client
-	toolRegistry *tools.Registry
-	mcpClient    *mcp.Client
-	costTracker  *costtracker.Tracker
-	hookManager  *hooks.Manager
-	canUseTool   types.CanUseToolFn
-	messages     []types.Message
-	sessionID    string
+	opts             Options
+	provider         api.MessageProvider
+	initErr          error
+	mcpClient        *mcp.Client
+	hookManager      *hooks.Manager
+	permissionConfig *permissions.Config
+	sessionsMu       sync.RWMutex
+	sessions         map[string]*Session
+	defaultSession   *Session
+	runSlots         chan struct{}
+	closed           atomic.Bool
+	closeOnce        sync.Once
+	lifetime         context.Context
+	cancel           context.CancelFunc
+	initWG           sync.WaitGroup
+	initSlot         chan struct{}
+	mcpTools         []namedTool
+}
+
+type namedTool struct {
+	name string
+	tool types.Tool
 }
 
 // New creates a new Agent.
 func New(opts Options) *Agent {
 	resolveEnvOptions(&opts)
+	opts.AllowedTools = cloneStringSlice(opts.AllowedTools)
+	opts.DisallowedTools = cloneStringSlice(opts.DisallowedTools)
+	opts.Agents = cloneAgentDefinitions(opts.Agents)
+	opts.MCPServers = cloneMCPServerConfigs(opts.MCPServers)
+	opts.CustomTools = append([]types.Tool(nil), opts.CustomTools...)
+	opts.CustomHeaders = cloneStringMap(opts.CustomHeaders)
+	opts.Env = cloneStringMap(opts.Env)
+	opts.Betas = cloneStringSlice(opts.Betas)
+	opts.SettingSources = cloneStringSlice(opts.SettingSources)
+	if opts.Thinking != nil {
+		thinking := *opts.Thinking
+		opts.Thinking = &thinking
+	}
+	if opts.Budget != nil {
+		budget := *opts.Budget
+		opts.Budget = &budget
+	}
+	if opts.JSONSchema != nil {
+		opts.JSONSchema = cloneCollection(reflect.ValueOf(opts.JSONSchema)).Interface().(map[string]interface{})
+	}
+	opts.Hooks = cloneHookConfig(opts.Hooks)
+	initErr := opts.Validate()
 
-	sessionID := uuid.New().String()
-
-	apiClient := api.NewClient(api.ClientConfig{
-		APIKey:        opts.APIKey,
-		BaseURL:       opts.BaseURL,
-		Model:         opts.Model,
-		Provider:      api.Provider(opts.Provider),
-		CustomHeaders: opts.CustomHeaders,
-		ProxyURL:      opts.ProxyURL,
-		TimeoutMs:     opts.TimeoutMs,
-	})
-
-	registry := tools.DefaultRegistry()
-	for _, t := range opts.CustomTools {
-		registry.Register(t)
+	provider := opts.ProviderClient
+	if provider == nil {
+		provider = api.NewClient(api.ClientConfig{
+			APIKey:        opts.APIKey,
+			BaseURL:       opts.BaseURL,
+			Model:         opts.Model,
+			Provider:      api.Provider(opts.Provider),
+			CustomHeaders: opts.CustomHeaders,
+			ProxyURL:      opts.ProxyURL,
+			TimeoutMs:     opts.TimeoutMs,
+		})
 	}
 
 	permConfig := &permissions.Config{Mode: opts.PermissionMode}
 	if permConfig.Mode == "" {
 		permConfig.Mode = types.PermissionModeBypassPermissions
 	}
-	canUseTool := opts.CanUseTool
-	if canUseTool == nil {
-		canUseTool = permissions.NewCanUseToolFn(permConfig, opts.AllowedTools)
-	}
-
 	hookManager := hooks.NewManager(opts.Hooks)
 
+	lifetime, cancel := context.WithCancel(context.Background())
 	a := &Agent{
-		opts:         opts,
-		apiClient:    apiClient,
-		toolRegistry: registry,
-		mcpClient:    mcp.NewClient(),
-		costTracker:  costtracker.NewTracker(sessionID),
-		hookManager:  hookManager,
-		canUseTool:   canUseTool,
-		sessionID:    sessionID,
+		opts:             opts,
+		provider:         provider,
+		initErr:          initErr,
+		mcpClient:        mcp.NewClient(),
+		hookManager:      hookManager,
+		permissionConfig: permConfig,
+		sessions:         make(map[string]*Session),
+		runSlots:         make(chan struct{}, opts.MaxConcurrentRuns),
+		lifetime:         lifetime, cancel: cancel, initSlot: make(chan struct{}, 1),
+	}
+	var defaultErr error
+	a.defaultSession, defaultErr = a.newSession(SessionOptions{})
+	if defaultErr != nil && a.initErr == nil {
+		a.initErr = defaultErr
+	}
+	return a
+}
+
+func (a *Agent) permissionPolicy(ctx context.Context) types.CanUseToolFn {
+	callback := a.opts.CanUseTool
+	if callback != nil {
+		hostCallback := callback
+		callback = func(tool types.Tool, input map[string]interface{}) (*types.PermissionDecision, error) {
+			result, err := a.hookManager.RunPermissionRequest(ctx, tool.Name(), input)
+			if err != nil {
+				return nil, err
+			}
+			if result.Blocked {
+				reason := result.Message
+				if reason == "" {
+					reason = "Blocked by PermissionRequest hook"
+				}
+				return &types.PermissionDecision{Behavior: types.PermissionDeny, Reason: reason}, nil
+			}
+			checkedInput := input
+			hookUpdated := false
+			if result.Output != nil && result.Output.UpdatedInput != nil {
+				checkedInput = result.Output.UpdatedInput
+				hookUpdated = true
+			}
+			decision, err := hostCallback(tool, checkedInput)
+			if decision != nil && decision.UpdatedInput == nil && hookUpdated {
+				decision.UpdatedInput = checkedInput
+			}
+			return decision, err
+		}
+	}
+	return permissions.NewPolicy(a.permissionConfig, a.opts.AllowedTools, a.opts.DisallowedTools, callback)
+}
+
+func (a *Agent) permissionBoundsPolicy() types.CanUseToolFn {
+	return permissions.NewPolicy(a.permissionConfig, a.opts.AllowedTools, a.opts.DisallowedTools,
+		func(types.Tool, map[string]interface{}) (*types.PermissionDecision, error) {
+			return &types.PermissionDecision{Behavior: types.PermissionAllow}, nil
+		})
+}
+
+func (a *Agent) newRegistry(s *Session) *tools.Registry {
+	registry := tools.DefaultRegistry()
+	for _, t := range a.opts.CustomTools {
+		registry.Register(t)
+	}
+	opts := a.opts
+	spawn := func(ctx context.Context, config tools.SubagentConfig) (string, error) {
+		return a.spawnSubagentWithTracker(ctx, config, s.costTracker)
 	}
 
 	// Register AgentTool with subagent spawner if definitions provided
@@ -218,11 +334,11 @@ func New(opts Options) *Agent {
 			defs[name] = tools.SubagentDefinition{
 				Description:  def.Description,
 				Instructions: def.Instructions,
-				Tools:        def.Tools,
+				Tools:        cloneStringSlice(def.Tools),
 				Model:        def.Model,
 			}
 		}
-		agentTool := tools.NewAgentTool(defs, a.spawnSubagent)
+		agentTool := tools.NewAgentTool(defs, spawn)
 		registry.Register(agentTool)
 	} else {
 		// Register with default agent types even if none configured
@@ -231,15 +347,35 @@ func New(opts Options) *Agent {
 			"explore":         {Description: "Fast agent for codebase exploration and search"},
 			"plan":            {Description: "Planning agent for designing implementation strategies"},
 		}
-		agentTool := tools.NewAgentTool(defaultDefs, a.spawnSubagent)
+		agentTool := tools.NewAgentTool(defaultDefs, spawn)
 		registry.Register(agentTool)
 	}
 
-	return a
+	return registry
 }
 
 // Init performs async initialization (MCP connections, etc.)
 func (a *Agent) Init(ctx context.Context) error {
+	a.sessionsMu.Lock()
+	if a.closed.Load() {
+		a.sessionsMu.Unlock()
+		return ErrAgentClosed
+	}
+	a.initWG.Add(1)
+	a.sessionsMu.Unlock()
+	defer a.initWG.Done()
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(a.lifetime, cancel)
+	defer func() { stop(); cancel() }()
+	select {
+	case a.initSlot <- struct{}{}:
+		defer func() { <-a.initSlot }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if a.opts.MCPServers == nil {
 		return nil
 	}
@@ -253,7 +389,13 @@ func (a *Agent) Init(ctx context.Context) error {
 
 		mcpTools := mcp.ToolsFromConnection(conn)
 		for _, t := range mcpTools {
-			a.toolRegistry.Register(t)
+			name := t.Name()
+			a.sessionsMu.Lock()
+			a.mcpTools = append(a.mcpTools, namedTool{name: name, tool: t})
+			for _, s := range a.sessions {
+				s.registry.RegisterNamed(name, t)
+			}
+			a.sessionsMu.Unlock()
 		}
 	}
 
@@ -262,105 +404,149 @@ func (a *Agent) Init(ctx context.Context) error {
 
 // QueryResult is the final result of a query.
 type QueryResult struct {
-	Text     string          `json:"text"`
-	Usage    types.Usage     `json:"usage"`
-	NumTurns int             `json:"num_turns"`
-	Duration time.Duration   `json:"duration"`
-	Messages []types.Message `json:"messages"`
-	Cost     float64         `json:"cost"`
+	Text              string                   `json:"text"`
+	Subtype           types.ResultSubtype      `json:"subtype"`
+	IsError           bool                     `json:"is_error"`
+	Errors            []string                 `json:"errors,omitempty"`
+	StopReason        string                   `json:"stop_reason,omitempty"`
+	Usage             types.Usage              `json:"usage"`
+	ModelUsage        map[string]types.Usage   `json:"model_usage,omitempty"`
+	PermissionDenials []types.PermissionDenial `json:"permission_denials,omitempty"`
+	NumTurns          int                      `json:"num_turns"`
+	Duration          time.Duration            `json:"duration"`
+	Messages          []types.Message          `json:"messages"`
+	Cost              float64                  `json:"cost"`
 }
 
 // Query runs the agentic loop with streaming events.
 func (a *Agent) Query(ctx context.Context, prompt string) (<-chan types.SDKMessage, <-chan error) {
-	eventCh := make(chan types.SDKMessage, 64)
-	errCh := make(chan error, 1)
+	if a.initErr != nil {
+		events := make(chan types.SDKMessage)
+		errs := make(chan error, 1)
+		errs <- a.initErr
+		close(events)
+		close(errs)
+		return events, errs
+	}
+	return a.defaultSession.Query(ctx, prompt)
+}
 
-	go func() {
-		defer close(eventCh)
-		defer close(errCh)
+// Validate checks whether Options contains supported values.
+func (o Options) Validate() error {
+	if o.MaxTurns < 0 {
+		return fmt.Errorf("%w: max turns must be positive", ErrInvalidOptions)
+	}
+	if math.IsNaN(o.MaxBudgetUSD) || math.IsInf(o.MaxBudgetUSD, 0) || o.MaxBudgetUSD < 0 {
+		return fmt.Errorf("%w: max budget must be finite and non-negative", ErrInvalidOptions)
+	}
+	if o.Budget != nil && (math.IsNaN(o.Budget.MaxUSD) || math.IsInf(o.Budget.MaxUSD, 0) || o.Budget.MaxUSD < 0) {
+		return fmt.Errorf("%w: budget max USD must be finite and non-negative", ErrInvalidOptions)
+	}
+	if o.TimeoutMs < 0 {
+		return fmt.Errorf("%w: timeout must be positive when specified", ErrInvalidOptions)
+	}
+	return validatePermissionMode(o.PermissionMode)
+}
 
-		err := a.runLoop(ctx, prompt, eventCh)
-		if err != nil {
-			errCh <- err
-		}
-	}()
-
-	return eventCh, errCh
+func validatePermissionMode(mode types.PermissionMode) error {
+	switch mode {
+	case "",
+		types.PermissionModeDefault,
+		types.PermissionModeAcceptEdits,
+		types.PermissionModeBypassPermissions,
+		types.PermissionModePlan,
+		types.PermissionModeDontAsk:
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported permission mode %q", ErrInvalidOptions, mode)
+	}
 }
 
 // Prompt runs a query and returns the final result (blocking).
 func (a *Agent) Prompt(ctx context.Context, prompt string) (*QueryResult, error) {
-	start := time.Now()
-	eventCh, errCh := a.Query(ctx, prompt)
-
-	var result QueryResult
-	var lastAssistantText string
-
-	for event := range eventCh {
-		switch event.Type {
-		case types.MessageTypeAssistant:
-			if event.Message != nil {
-				if text := types.ExtractText(event.Message); text != "" {
-					lastAssistantText = text
-				}
-			}
-		case types.MessageTypeResult:
-			if event.Usage != nil {
-				result.Usage = *event.Usage
-			}
-			result.NumTurns = event.NumTurns
-			result.Cost = event.Cost
-		}
+	if a.initErr != nil {
+		return nil, a.initErr
 	}
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return nil, err
-		}
-	default:
-	}
-
-	result.Text = lastAssistantText
-	result.Duration = time.Since(start)
-	result.Messages = append([]types.Message{}, a.messages...)
-
-	return &result, nil
+	return a.defaultSession.Prompt(ctx, prompt)
 }
 
 // GetMessages returns conversation history.
 func (a *Agent) GetMessages() []types.Message {
-	return append([]types.Message{}, a.messages...)
+	return a.defaultSession.GetMessages()
 }
 
 // Clear resets conversation history.
 func (a *Agent) Clear() {
-	a.messages = nil
+	a.defaultSession.Clear()
 }
 
 // Close cleans up resources.
 func (a *Agent) Close() {
-	a.mcpClient.Close()
+	a.closeOnce.Do(func() {
+		a.sessionsMu.Lock()
+		a.closed.Store(true)
+		sessions := make([]*Session, 0, len(a.sessions))
+		for _, s := range a.sessions {
+			sessions = append(sessions, s)
+		}
+		a.sessionsMu.Unlock()
+		a.cancel()
+		// Cancel all sessions before joining any: no session can hold up cancellation.
+		for _, s := range sessions {
+			s.requestClose()
+		}
+		for _, s := range sessions {
+			s.Close()
+		}
+		a.initWG.Wait()
+		a.mcpClient.Close()
+	})
 }
 
 // spawnSubagent creates a child agent and runs a prompt synchronously.
 func (a *Agent) spawnSubagent(ctx context.Context, config tools.SubagentConfig) (string, error) {
+	return a.spawnSubagentWithTracker(ctx, config, a.defaultSession.costTracker)
+}
+
+func (a *Agent) spawnSubagentWithTracker(ctx context.Context, config tools.SubagentConfig, tracker *costtracker.Tracker) (text string, retErr error) {
+	start, err := a.hookManager.RunSubagentStart(ctx, config.Name)
+	if hookErr := hookOutcomeError(hooks.HookSubagentStart, start, err); hookErr != nil {
+		return "", hookErr
+	}
+	defer func() {
+		cleanupCtx, cancel := hookCleanupContext(ctx)
+		defer cancel()
+		stop, err := a.hookManager.RunSubagentStop(cleanupCtx, config.Name)
+		if hookErr := hookOutcomeError(hooks.HookSubagentStop, stop, err); hookErr != nil {
+			retErr = errors.Join(retErr, hookErr)
+		}
+	}()
 	model := config.Model
 	if model == "" {
 		model = a.opts.Model
 	}
+	var childDeniedTools []string
+	if definition, ok := a.opts.Agents[config.Name]; ok {
+		childDeniedTools = definition.DisallowedTools
+	}
 
 	childOpts := Options{
-		Model:          model,
-		APIKey:         a.opts.APIKey,
-		BaseURL:        a.opts.BaseURL,
-		CWD:            config.CWD,
-		MaxTurns:       30,
-		PermissionMode: a.opts.PermissionMode,
-		SystemPrompt:   config.SystemPrompt,
-		CustomHeaders:  a.opts.CustomHeaders,
-		ProxyURL:       a.opts.ProxyURL,
-		TimeoutMs:      a.opts.TimeoutMs,
+		ProviderClient:  a.provider,
+		Model:           model,
+		APIKey:          a.opts.APIKey,
+		BaseURL:         a.opts.BaseURL,
+		CWD:             config.CWD,
+		MaxTurns:        30,
+		MaxBudgetUSD:    a.opts.MaxBudgetUSD,
+		Budget:          a.opts.Budget,
+		PermissionMode:  a.opts.PermissionMode,
+		AllowedTools:    intersectToolBounds(a.opts.AllowedTools, config.Tools),
+		DisallowedTools: unionToolBounds(a.opts.DisallowedTools, childDeniedTools),
+		SystemPrompt:    config.SystemPrompt,
+		CustomHeaders:   a.opts.CustomHeaders,
+		ProxyURL:        a.opts.ProxyURL,
+		TimeoutMs:       a.opts.TimeoutMs,
+		sharedLedger:    ledgerFromContext(ctx),
 	}
 
 	if childOpts.CWD == "" {
@@ -382,17 +568,20 @@ func (a *Agent) spawnSubagent(ctx context.Context, config tools.SubagentConfig) 
 	}
 
 	result, err := child.Prompt(ctx, config.Prompt)
+	// Session aggregates include child usage even when the child terminates with
+	// an error. The shared Run ledger was already charged at model completion.
+	if tracker != nil {
+		for childModel, usage := range child.CostTracker().AllModelUsage() {
+			tracker.AddUsage(childModel, &types.Usage{
+				InputTokens:              usage.InputTokens,
+				OutputTokens:             usage.OutputTokens,
+				CacheReadInputTokens:     usage.CacheReadInputTokens,
+				CacheCreationInputTokens: usage.CacheCreationInputTokens,
+			})
+		}
+	}
 	if err != nil {
 		return "", err
-	}
-
-	// Merge cost into parent tracker
-	if child.costTracker != nil && a.costTracker != nil {
-		childIn, childOut := child.costTracker.TotalTokens()
-		a.costTracker.AddUsage(model, &types.Usage{
-			InputTokens:  childIn,
-			OutputTokens: childOut,
-		})
 	}
 
 	return result.Text, nil
@@ -400,12 +589,12 @@ func (a *Agent) spawnSubagent(ctx context.Context, config tools.SubagentConfig) 
 
 // SessionID returns the current session ID.
 func (a *Agent) SessionID() string {
-	return a.sessionID
+	return a.defaultSession.SessionID()
 }
 
 // CostTracker returns the cost tracker.
 func (a *Agent) CostTracker() *costtracker.Tracker {
-	return a.costTracker
+	return a.defaultSession.costTracker
 }
 
 // MCPClient returns the MCP client for managing MCP server connections.
@@ -454,4 +643,123 @@ func resolveEnvOptions(opts *Options) {
 	if opts.MaxTurns == 0 {
 		opts.MaxTurns = defaultMaxTurns
 	}
+	if opts.MaxConcurrentRuns <= 0 {
+		opts.MaxConcurrentRuns = defaultMaxConcurrentRuns
+	}
+	if opts.MaxConcurrentTools <= 0 {
+		opts.MaxConcurrentTools = defaultMaxConcurrentTools
+	}
+}
+
+func cloneHookConfig(config hooks.HookConfig) hooks.HookConfig {
+	// HookConfig consists of rule slices; clone collections and retain function
+	// references explicitly. Callbacks themselves must support concurrent sessions.
+	out := reflect.ValueOf(&config).Elem()
+	for i := 0; i < out.NumField(); i++ {
+		rules := out.Field(i)
+		if rules.IsNil() {
+			continue
+		}
+		copied := reflect.MakeSlice(rules.Type(), rules.Len(), rules.Len())
+		for j := 0; j < rules.Len(); j++ {
+			copied.Index(j).Set(rules.Index(j))
+			rule := copied.Index(j)
+			for k := 0; k < rule.NumField(); k++ {
+				if rule.Field(k).Kind() == reflect.Slice {
+					rule.Field(k).Set(cloneCollection(rule.Field(k)))
+				}
+			}
+		}
+		rules.Set(copied)
+	}
+	return config
+}
+
+func cloneStringSlice(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneAgentDefinitions(definitions map[string]AgentDefinition) map[string]AgentDefinition {
+	if definitions == nil {
+		return nil
+	}
+	cloned := make(map[string]AgentDefinition, len(definitions))
+	for name, definition := range definitions {
+		definition.Tools = cloneStringSlice(definition.Tools)
+		definition.DisallowedTools = cloneStringSlice(definition.DisallowedTools)
+		definition.Skills = cloneStringSlice(definition.Skills)
+		definition.MCPServers = cloneMCPServerConfigs(definition.MCPServers)
+		cloned[name] = definition
+	}
+	return cloned
+}
+
+func cloneMCPServerConfigs(configs map[string]types.MCPServerConfig) map[string]types.MCPServerConfig {
+	if configs == nil {
+		return nil
+	}
+	cloned := make(map[string]types.MCPServerConfig, len(configs))
+	for name, config := range configs {
+		config.Args = cloneStringSlice(config.Args)
+		config.Env = cloneStringMap(config.Env)
+		config.Headers = cloneStringMap(config.Headers)
+		cloned[name] = config
+	}
+	return cloned
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func intersectToolBounds(parent, child []string) []string {
+	if parent == nil {
+		return cloneStringSlice(child)
+	}
+	if child == nil {
+		return cloneStringSlice(parent)
+	}
+
+	childSet := make(map[string]bool, len(child))
+	for _, name := range child {
+		childSet[name] = true
+	}
+	intersection := make([]string, 0)
+	for _, name := range parent {
+		if childSet[name] {
+			intersection = append(intersection, name)
+		}
+	}
+	return intersection
+}
+
+func unionToolBounds(parent, child []string) []string {
+	if parent == nil && child == nil {
+		return nil
+	}
+
+	union := make([]string, 0, len(parent)+len(child))
+	seen := make(map[string]bool, len(parent)+len(child))
+	for _, bounds := range [][]string{parent, child} {
+		for _, name := range bounds {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			union = append(union, name)
+		}
+	}
+	return union
 }

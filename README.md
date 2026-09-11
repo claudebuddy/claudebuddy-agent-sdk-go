@@ -1,4 +1,4 @@
-# Open Agent SDK (Go)
+# ClaudeBuddy Agent SDK for Go
 
 A lightweight, open-source Go SDK for building AI agents. Run the full agent loop in-process — no CLI or subprocess required. Deploy anywhere: cloud, serverless, Docker, CI/CD.
 
@@ -7,21 +7,23 @@ Also available in [TypeScript](https://github.com/claudebuddy/claudebuddy-agent-
 ## Features
 
 - **Agent Loop** — Streaming agentic loop with tool execution, multi-turn conversations, and cost tracking
+- **Concurrent Runtime** — One shared Agent can run many isolated Sessions concurrently, with bounded Run and tool capacity
+- **Explicit Terminals** — Structured success, cancellation, turn-limit, budget-limit, and execution-error results
 - **Multi-Provider** — Native support for both Anthropic and OpenAI-compatible APIs (auto-detected)
 - **32 Built-in Tools** — Bash, Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, Agent (subagents), SendMessage, Tasks, Todo, Config, Cron, PlanMode, Worktree, LSP, NotebookEdit, MCP Resources, and more
 - **MCP Support** — Connect to MCP servers via stdio, HTTP, SSE transports, plus in-process SDK server
 - **Permission System** — Configurable tool approval with allow/deny rules, runtime mode changes, filesystem path validation, and directory allowlisting
-- **Hook System** — 11 hook events: PreToolUse, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop, SubagentStop, SubagentStart, PreCompact, Notification, PermissionRequest, PostSampling
+- **Hook System** — 13 lifecycle events across tools, prompts, sampling, child agents, Sessions, permissions, notifications, and Stop
 - **Extended Thinking** — Three modes (adaptive, enabled, disabled) with effort levels (low/medium/high/max)
 - **Session Management** — List, get, rename, tag, delete, and fork sessions
 - **Rate Limiting** — Parse API rate limit headers, track utilization, detect rejections
 - **Context Usage** — Track token distribution across messages, tools, and context window percentage
 - **File Checkpointing** — Snapshot and rewind file state to any checkpoint
-- **Sandbox** — Command, file, and network access control
+- **Policy Validator** — Command, file, and network policy checks (not operating-system isolation)
 - **Plugins** — Local plugin loading from manifest files
 - **Cost Tracking** — Per-model token usage, API/tool duration, code change stats
 - **Fallback Model** — Automatic retry with a fallback model on API failure
-- **Subagent System** — Enhanced agent definitions with skills, memory, effort, maxTurns, background mode, per-agent permissions and MCP servers
+- **Subagent System** — Child agents with explicit model, prompt, tool bounds, cancellation, and shared Run accounting
 - **Custom Tools** — Implement the `Tool` interface to add your own tools
 
 ## Quick Start
@@ -130,20 +132,33 @@ a := agent.New(agent.Options{
             Instructions: "You are a research specialist...",
             Model:        "opus-4-6",
             Tools:        []string{"Read", "Glob", "Grep", "WebSearch"},
-            MaxTurns:     20,
-            Effort:       agent.EffortHigh,
         },
         "coder": {
             Description:    "Coding agent for implementation",
             Instructions:   "You are a coding specialist...",
             DisallowedTools: []string{"WebSearch", "WebFetch"},
-            PermissionMode: types.PermissionModeAcceptEdits,
         },
     },
 })
 ```
 
 ## Session Management
+
+For live conversations, create isolated runtime Sessions. One Agent may execute
+many Sessions concurrently, while each Session allows one active Run:
+
+```go
+customer, err := a.NewSession(agent.SessionOptions{ID: "customer-123"})
+if err != nil {
+    log.Fatal(err)
+}
+result, err := customer.Prompt(ctx, "Summarize my conversation")
+```
+
+See [concurrent runtime](docs/runtime-concurrency.md) for Run events, capacity,
+cancellation, budgets, terminal statuses, permissions, and forking.
+
+The standalone `session` package manages saved session files:
 
 ```go
 import "github.com/claudebuddy/claudebuddy-agent-sdk-go/session"
@@ -177,8 +192,8 @@ a := agent.New(agent.Options{
             },
         }},
         // Also: PostToolUse, PostToolUseFailure, UserPromptSubmit,
-        // Stop, SubagentStop, SubagentStart, PreCompact,
-        // Notification, PermissionRequest, PostSampling
+		// Stop, SubagentStop, SubagentStart, SessionStart, SessionEnd,
+		// PreCompact, Notification, PermissionRequest, PostSampling
     },
 })
 ```
@@ -275,11 +290,11 @@ tracker := ratelimit.NewTracker(func(event ratelimit.RateLimitEvent) {
     }
 })
 
-// Called automatically with API response headers
+// Call this from a host transport when response headers are available.
 tracker.ParseHeaders(resp.Header)
 ```
 
-## Sandbox
+## Policy validation
 
 ```go
 import "github.com/claudebuddy/claudebuddy-agent-sdk-go/sandbox"
@@ -298,6 +313,9 @@ validator := sandbox.NewValidator(sandbox.Settings{
 validator.IsCommandAllowed("git status")  // true
 validator.IsCommandAllowed("rm -rf /")    // false
 ```
+
+This validator evaluates policy only. It does not create an OS sandbox or
+isolate a process.
 
 ## Custom Tools
 
@@ -336,7 +354,8 @@ a := agent.New(agent.Options{
 | 08  | [One-shot Query](examples/08-official-api-compat/)        | Quick one-shot agent query                       |
 | 09  | [Subagents](examples/09-subagents/)                       | Specialized subagent with restricted tools       |
 | 10  | [Permissions](examples/10-permissions/)                   | Read-only agent with AllowedTools                |
-| 11  | [Web Chat](examples/web/)                                 | Web-based chat UI with streaming                 |
+| 11  | [Concurrent Sessions](examples/11-concurrent-sessions/)   | Two isolated Sessions on one shared Agent        |
+| Web | [Web Chat](examples/web/)                                 | Web-based chat UI with streaming                 |
 
 Run any example:
 
@@ -350,7 +369,7 @@ go run ./examples/01-simple-query/
 ## Architecture
 
 ```
-open-agent-sdk-go/
+claudebuddy-agent-sdk-go/
 ├── agent/              # Agent loop, query engine, effort, fallback model
 ├── api/                # API client (Anthropic + OpenAI dual protocol)
 ├── types/              # Core types: Message, Tool, ContentBlock, MCP
@@ -358,7 +377,7 @@ open-agent-sdk-go/
 │   └── diff/           # Unified diff generation
 ├── mcp/                # MCP client + SDK server + resources + reconnection
 ├── permissions/        # Permission rules, runtime management, filesystem validation
-├── hooks/              # 11 hook events with extended hook support
+├── hooks/              # 13 lifecycle hook events with extended hook support
 ├── costtracker/        # Token usage and cost tracking
 ├── context/            # System/user context injection (git status, CLAUDEBUDDY.md)
 ├── history/            # Conversation history persistence (JSONL)
@@ -366,9 +385,9 @@ open-agent-sdk-go/
 ├── ratelimit/          # Rate limit header parsing and tracking
 ├── contextusage/       # Context window usage tracking
 ├── checkpoint/         # File state checkpointing and rewind
-├── sandbox/            # Sandbox access control (commands, files, network)
+├── sandbox/            # Policy validation (commands, files, network)
 ├── plugins/            # Local plugin loading and management
-└── examples/           # 11 runnable examples
+└── examples/           # Runnable CLI and web examples
 ```
 
 ## Configuration
@@ -377,16 +396,19 @@ Environment variables:
 
 | Variable                     | Description                                  |
 | ---------------------------- | -------------------------------------------- |
-| `CLAUDEBUDDY_API_KEY`            | API key (required)                           |
-| `CLAUDEBUDDY_MODEL`              | Default model (default: `sonnet-4-6`)        |
-| `CLAUDEBUDDY_BASE_URL`           | API base URL override                        |
-| `CLAUDEBUDDY_CUSTOM_HEADERS`     | Custom headers (comma-separated `key:value`) |
+| `CLAUDEBUDDY_API_KEY`        | API key (required)                           |
+| `CLAUDEBUDDY_MODEL`          | Default model (default: `sonnet-4-6`)        |
+| `CLAUDEBUDDY_BASE_URL`       | API base URL override                        |
+| `CLAUDEBUDDY_CUSTOM_HEADERS` | Custom headers (comma-separated `key:value`) |
 | `API_TIMEOUT_MS`             | API request timeout in ms                    |
 | `HTTPS_PROXY` / `HTTP_PROXY` | Proxy URL                                    |
 
 Also supports `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` for compatibility.
 
 ## Links
+
+- Runtime guide: [docs/runtime-concurrency.md](docs/runtime-concurrency.md)
+- Migration guide: [docs/migration-to-claudebuddy.md](docs/migration-to-claudebuddy.md)
 
 - Website: [ClaudeBuddy GitHub organization](https://github.com/claudebuddy)
 - TypeScript SDK: [github.com/claudebuddy/claudebuddy-agent-sdk](https://github.com/claudebuddy/claudebuddy-agent-sdk)

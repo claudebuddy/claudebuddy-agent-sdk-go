@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/api"
 	agentcontext "github.com/claudebuddy/claudebuddy-agent-sdk-go/context"
+	"github.com/claudebuddy/claudebuddy-agent-sdk-go/costtracker"
+	"github.com/claudebuddy/claudebuddy-agent-sdk-go/hooks"
+	"github.com/claudebuddy/claudebuddy-agent-sdk-go/permissions"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/tools"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/types"
 )
@@ -17,9 +21,22 @@ import (
 const defaultSystemPrompt = `You are an AI assistant with access to tools. Use the tools available to you to help the user with their request. Be concise and direct in your responses.`
 
 // runLoop is the main agentic loop.
-func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types.SDKMessage) error {
-	startTime := time.Now()
-
+func (r *Run) runLoop(prompt string) error {
+	s := r.session
+	a := s.runtime
+	ctx := r.ctx
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	promptHook, err := a.hookManager.RunUserPromptSubmit(ctx, prompt)
+	if hookErr := hookOutcomeError(hooks.HookUserPromptSubmit, promptHook, err); hookErr != nil {
+		return hookErr
+	}
+	if promptHook.Output != nil && promptHook.Output.UpdatedInput != nil {
+		if updated, ok := promptHook.Output.UpdatedInput["prompt"].(string); ok {
+			prompt = updated
+		}
+	}
 	// Build system prompt
 	systemPrompt := a.opts.SystemPrompt
 	if systemPrompt == "" {
@@ -60,36 +77,11 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 		UUID:      uuid.New().String(),
 		Timestamp: time.Now(),
 	}
-	a.messages = append(a.messages, userMsg)
+	s.appendMessage(userMsg)
 
-	// Build tool params - filter by allowedTools and disallowedTools
-	allTools := a.toolRegistry.All()
-	if len(a.opts.AllowedTools) > 0 {
-		allowedSet := make(map[string]bool, len(a.opts.AllowedTools))
-		for _, name := range a.opts.AllowedTools {
-			allowedSet[name] = true
-		}
-		var filtered []types.Tool
-		for _, t := range allTools {
-			if allowedSet[t.Name()] {
-				filtered = append(filtered, t)
-			}
-		}
-		allTools = filtered
-	}
-	if len(a.opts.DisallowedTools) > 0 {
-		disallowedSet := make(map[string]bool, len(a.opts.DisallowedTools))
-		for _, name := range a.opts.DisallowedTools {
-			disallowedSet[name] = true
-		}
-		var filtered []types.Tool
-		for _, t := range allTools {
-			if !disallowedSet[t.Name()] {
-				filtered = append(filtered, t)
-			}
-		}
-		allTools = filtered
-	}
+	// Apply the same immutable tool bounds to model-visible schemas that the
+	// executor enforces again against the concrete registry tool.
+	allTools := permissions.FilterTools(s.registry.All(), a.opts.AllowedTools, a.opts.DisallowedTools)
 	apiTools := make([]api.APIToolParam, len(allTools))
 	for i, t := range allTools {
 		apiTools[i] = api.ToolToAPIParam(t)
@@ -97,35 +89,31 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 
 	// Create tool context
 	toolCtx := &types.ToolUseContext{
-		WorkingDir:    a.opts.CWD,
-		AbortCtx:      ctx,
-		ReadFileState: make(map[string]*types.FileReadState),
+		WorkingDir:      a.opts.CWD,
+		AbortCtx:        ctx,
+		ReadFileState:   make(map[string]*types.FileReadState),
+		ReadFileStateMu: &sync.RWMutex{},
 	}
 
 	// Create tool executor
-	executor := tools.NewExecutor(a.toolRegistry, a.canUseTool, toolCtx)
+	executor := tools.NewExecutorWithOptions(tools.ExecutorOptions{Registry: s.registry, CanUseTool: a.permissionPolicy(ctx), RecheckTool: a.permissionBoundsPolicy(), ToolContext: toolCtx, MaxConcurrency: a.opts.MaxConcurrentTools, Hooks: a.hookManager})
 
-	var totalUsage types.Usage
 	turn := 0
 
 	// Main loop
 	for turn < a.opts.MaxTurns {
-		turn++
-
-		// Check budget
-		if a.opts.MaxBudgetUSD > 0 && a.costTracker.TotalCost() >= a.opts.MaxBudgetUSD {
-			eventCh <- types.SDKMessage{
-				Type: types.MessageTypeSystem,
-				Text: fmt.Sprintf("Budget limit reached ($%.2f)", a.opts.MaxBudgetUSD),
-			}
-			break
+		if err := r.checkAdmission(); err != nil {
+			return err
 		}
+		turn++
+		r.result.NumTurns = turn
 
 		// Build API messages from conversation history
-		apiMessages := a.buildAPIMessages()
+		apiMessages := s.buildAPIMessages()
 
 		// Call the API
 		req := api.MessagesRequest{
+			Model:    a.opts.Model,
 			System:   apiSystemBlocks,
 			Messages: apiMessages,
 			Tools:    apiTools,
@@ -174,8 +162,6 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 			}
 		}
 
-		streamEvents, streamErr := a.apiClient.CreateMessageStream(ctx, req)
-
 		// Accumulate the assistant response
 		assistantMsg := &types.Message{
 			Type:      types.MessageTypeAssistant,
@@ -185,33 +171,11 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 		}
 
 		var toolUseBlocks []types.ToolUseBlock
-		var streamError error
-
-		// Process stream
-	streamLoop:
-		for {
-			select {
-			case event, ok := <-streamEvents:
-				if !ok {
-					break streamLoop
-				}
-				a.processStreamEvent(event, assistantMsg, &toolUseBlocks)
-
-			case err := <-streamErr:
-				if err != nil {
-					streamError = err
-				}
-				break streamLoop
-
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
+		usedModel := req.Model
+		streamError := r.readStream(req, assistantMsg, &toolUseBlocks)
 
 		// If stream failed and fallback model is configured, retry with fallback
-		if streamError != nil && a.opts.FallbackModel != "" && a.apiClient.Model() != a.opts.FallbackModel {
-			a.apiClient.SetModel(a.opts.FallbackModel)
-
+		if streamError != nil && ctx.Err() == nil && a.opts.FallbackModel != "" && req.Model != a.opts.FallbackModel {
 			// Reset assistant message for retry
 			assistantMsg = &types.Message{
 				Type:      types.MessageTypeAssistant,
@@ -221,62 +185,50 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 			}
 			toolUseBlocks = nil
 
-			streamEvents, streamErr = a.apiClient.CreateMessageStream(ctx, req)
-			streamError = nil
-
-		fallbackStreamLoop:
-			for {
-				select {
-				case event, ok := <-streamEvents:
-					if !ok {
-						break fallbackStreamLoop
-					}
-					a.processStreamEvent(event, assistantMsg, &toolUseBlocks)
-
-				case err := <-streamErr:
-					if err != nil {
-						return fmt.Errorf("API stream error (fallback model %s): %w", a.opts.FallbackModel, err)
-					}
-					break fallbackStreamLoop
-
-				case <-ctx.Done():
-					return ctx.Err()
-				}
+			fallbackReq := req
+			fallbackReq.Model = a.opts.FallbackModel
+			if err := r.readStream(fallbackReq, assistantMsg, &toolUseBlocks); err != nil {
+				return fmt.Errorf("API stream error (fallback model %s): %w", a.opts.FallbackModel, err)
 			}
+			usedModel = fallbackReq.Model
 		} else if streamError != nil {
 			return fmt.Errorf("API stream error: %w", streamError)
+		}
+		postSampling, err := a.hookManager.RunPostSampling(ctx)
+		if hookErr := hookOutcomeError(hooks.HookPostSampling, postSampling, err); hookErr != nil {
+			return hookErr
 		}
 
 		// Update usage
 		if assistantMsg.Usage != nil {
-			totalUsage.InputTokens += assistantMsg.Usage.InputTokens
-			totalUsage.OutputTokens += assistantMsg.Usage.OutputTokens
-			totalUsage.CacheReadInputTokens += assistantMsg.Usage.CacheReadInputTokens
-			totalUsage.CacheCreationInputTokens += assistantMsg.Usage.CacheCreationInputTokens
-			a.costTracker.AddUsage(a.opts.Model, assistantMsg.Usage)
+			cost := costtracker.EstimateCost(usedModel, assistantMsg.Usage)
+			r.ledger.Add(usedModel, *assistantMsg.Usage, cost)
+			s.costTracker.AddUsage(usedModel, assistantMsg.Usage)
 		}
+		r.result.StopReason = assistantMsg.StopReason
 
 		// Store assistant message
-		a.messages = append(a.messages, *assistantMsg)
+		s.appendMessage(*assistantMsg)
 
 		// Emit assistant event
-		eventCh <- types.SDKMessage{
+		if err := r.emit(types.SDKMessage{
 			Type:    types.MessageTypeAssistant,
 			Message: assistantMsg,
+		}); err != nil {
+			return err
 		}
 
 		// Check if we need to run tools
 		if len(toolUseBlocks) == 0 {
 			// No tool calls — end of turn
-			break
+			return nil
 		}
 
 		// Check stop reason
-		if assistantMsg.StopReason == "end_turn" && len(toolUseBlocks) == 0 {
-			break
-		}
-
 		// Execute tools
+		if err := r.checkAdmission(); err != nil {
+			return err
+		}
 		toolCalls := make([]tools.ToolCallRequest, len(toolUseBlocks))
 		for i, tb := range toolUseBlocks {
 			toolCalls[i] = tools.ToolCallRequest{
@@ -287,6 +239,11 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 		}
 
 		results := executor.RunTools(ctx, toolCalls)
+		for _, result := range results {
+			if result.PermissionDenial != nil {
+				r.result.PermissionDenials = append(r.result.PermissionDenials, *result.PermissionDenial)
+			}
+		}
 
 		// Build tool result message
 		var toolResultContent []types.ContentBlock
@@ -318,7 +275,7 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 			UUID:      uuid.New().String(),
 			Timestamp: time.Now(),
 		}
-		a.messages = append(a.messages, toolResultMsg)
+		s.appendMessage(toolResultMsg)
 
 		// Emit tool result events so SSE consumers can display them
 		for _, result := range results {
@@ -329,7 +286,7 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 					textContent += c.Text
 				}
 			}
-			eventCh <- types.SDKMessage{
+			if err := r.emit(types.SDKMessage{
 				Type:  "tool_result",
 				Text:  textContent,
 				Usage: &types.Usage{},
@@ -345,25 +302,55 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 						},
 					},
 				},
+			}); err != nil {
+				return err
 			}
 		}
 	}
 
-	// Emit result
-	eventCh <- types.SDKMessage{
-		Type:     types.MessageTypeResult,
-		Text:     types.ExtractText(&a.messages[len(a.messages)-1]),
-		Usage:    &totalUsage,
-		NumTurns: turn,
-		Duration: time.Since(startTime).Milliseconds(),
-		Cost:     a.costTracker.TotalCost(),
-	}
+	return ErrMaxTurns
+}
 
-	return nil
+// readStream ignores closed error channels until buffered events are consumed.
+// Each provider attempt has a child context so fallback/early exit cancels the
+// preceding producer. Transport-level completion validation belongs to phase 2.
+func (r *Run) readStream(req api.MessagesRequest, msg *types.Message, blocks *[]types.ToolUseBlock) error {
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(r.ctx)
+	defer cancel()
+	events, errs := r.session.runtime.provider.CreateMessageStream(ctx, req)
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				// Legacy providers may leave an empty error channel open. Read any
+				// already published terminal error without waiting indefinitely.
+				select {
+				case err := <-errs:
+					return err
+				default:
+					return ctx.Err()
+				}
+			}
+			r.processStreamEvent(event, msg, blocks)
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // processStreamEvent accumulates streaming data into the assistant message.
-func (a *Agent) processStreamEvent(event api.StreamEvent, msg *types.Message, toolUseBlocks *[]types.ToolUseBlock) {
+func (r *Run) processStreamEvent(event api.StreamEvent, msg *types.Message, toolUseBlocks *[]types.ToolUseBlock) {
 	switch event.Type {
 	case "message_start":
 		if event.Message != nil {
@@ -456,10 +443,10 @@ func (a *Agent) processStreamEvent(event api.StreamEvent, msg *types.Message, to
 
 // buildAPIMessages converts internal messages to API format.
 // Normalizes content blocks to only include fields required by the API.
-func (a *Agent) buildAPIMessages() []api.APIMessage {
+func (s *Session) buildAPIMessages() []api.APIMessage {
 	var apiMsgs []api.APIMessage
 
-	for _, msg := range a.messages {
+	for _, msg := range s.GetMessages() {
 		var normalized []types.ContentBlock
 		for _, block := range msg.Content {
 			switch block.Type {

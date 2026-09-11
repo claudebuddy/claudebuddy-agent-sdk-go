@@ -20,11 +20,11 @@ const (
 type ContentBlockType string
 
 const (
-	ContentBlockText      ContentBlockType = "text"
-	ContentBlockToolUse   ContentBlockType = "tool_use"
+	ContentBlockText       ContentBlockType = "text"
+	ContentBlockToolUse    ContentBlockType = "tool_use"
 	ContentBlockToolResult ContentBlockType = "tool_result"
-	ContentBlockThinking  ContentBlockType = "thinking"
-	ContentBlockImage     ContentBlockType = "image"
+	ContentBlockThinking   ContentBlockType = "thinking"
+	ContentBlockImage      ContentBlockType = "image"
 )
 
 // ContentBlock represents a block of content in a message.
@@ -105,7 +105,7 @@ type Message struct {
 	Timestamp time.Time      `json:"timestamp"`
 
 	// For assistant messages
-	Model     string `json:"model,omitempty"`
+	Model      string `json:"model,omitempty"`
 	StopReason string `json:"stop_reason,omitempty"`
 
 	// Usage tracking
@@ -120,6 +120,23 @@ type Usage struct {
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
 }
 
+// ResultSubtype identifies the authoritative outcome of a Run.
+type ResultSubtype string
+
+const (
+	ResultSuccess              ResultSubtype = "success"
+	ResultCancelled            ResultSubtype = "cancelled"
+	ResultErrorMaxTurns        ResultSubtype = "error_max_turns"
+	ResultErrorMaxBudget       ResultSubtype = "error_max_budget_usd"
+	ResultErrorDuringExecution ResultSubtype = "error_during_execution"
+)
+
+// PermissionDenial records a tool call rejected by runtime policy.
+type PermissionDenial struct {
+	Tool   string `json:"tool"`
+	Reason string `json:"reason"`
+}
+
 // SDKMessage is the streaming event type yielded by the agent loop.
 type SDKMessage struct {
 	Type MessageType `json:"type"`
@@ -128,12 +145,18 @@ type SDKMessage struct {
 	Message *Message `json:"message,omitempty"`
 
 	// For "result" type
-	Text     string   `json:"text,omitempty"`
-	Usage    *Usage   `json:"usage,omitempty"`
-	NumTurns int      `json:"num_turns,omitempty"`
-	Duration int64    `json:"duration_ms,omitempty"`
-	Messages []Message `json:"messages,omitempty"`
-	Cost     float64  `json:"cost,omitempty"`
+	Text              string             `json:"text,omitempty"`
+	Subtype           ResultSubtype      `json:"subtype,omitempty"`
+	IsError           bool               `json:"is_error,omitempty"`
+	Errors            []string           `json:"errors,omitempty"`
+	StopReason        string             `json:"stop_reason,omitempty"`
+	Usage             *Usage             `json:"usage,omitempty"`
+	ModelUsage        map[string]Usage   `json:"model_usage,omitempty"`
+	PermissionDenials []PermissionDenial `json:"permission_denials,omitempty"`
+	NumTurns          int                `json:"num_turns,omitempty"`
+	Duration          int64              `json:"duration_ms,omitempty"`
+	Messages          []Message          `json:"messages,omitempty"`
+	Cost              float64            `json:"cost,omitempty"`
 }
 
 // ToolUseBlock extracts tool use info from a content block.

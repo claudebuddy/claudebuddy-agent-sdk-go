@@ -66,8 +66,8 @@ func (t *FileWriteTool) Call(ctx context.Context, input map[string]interface{}, 
 	isCreate := os.IsNotExist(readErr)
 
 	// For existing files, check staleness
-	if readErr == nil && tCtx != nil && tCtx.ReadFileState != nil {
-		if state, ok := tCtx.ReadFileState[filePath]; ok {
+	if readErr == nil {
+		if state, ok := tCtx.GetFileReadState(filePath); ok {
 			// Verify content hasn't changed since last read
 			if state.Content != string(existingData) {
 				info, _ := os.Stat(filePath)
@@ -95,12 +95,10 @@ func (t *FileWriteTool) Call(ctx context.Context, input map[string]interface{}, 
 	}
 
 	// Update file state cache
-	if tCtx != nil && tCtx.ReadFileState != nil {
-		tCtx.ReadFileState[filePath] = &types.FileReadState{
-			Content:   content,
-			Timestamp: time.Now().UnixMilli(),
-		}
-	}
+	tCtx.SetFileReadState(filePath, &types.FileReadState{
+		Content:   content,
+		Timestamp: time.Now().UnixMilli(),
+	})
 
 	writeType := "update"
 	if isCreate {
