@@ -10,6 +10,7 @@ import (
 
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/api"
 	agentcontext "github.com/claudebuddy/claudebuddy-agent-sdk-go/context"
+	"github.com/claudebuddy/claudebuddy-agent-sdk-go/permissions"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/tools"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/types"
 )
@@ -62,34 +63,9 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 	}
 	a.messages = append(a.messages, userMsg)
 
-	// Build tool params - filter by allowedTools and disallowedTools
-	allTools := a.toolRegistry.All()
-	if len(a.opts.AllowedTools) > 0 {
-		allowedSet := make(map[string]bool, len(a.opts.AllowedTools))
-		for _, name := range a.opts.AllowedTools {
-			allowedSet[name] = true
-		}
-		var filtered []types.Tool
-		for _, t := range allTools {
-			if allowedSet[t.Name()] {
-				filtered = append(filtered, t)
-			}
-		}
-		allTools = filtered
-	}
-	if len(a.opts.DisallowedTools) > 0 {
-		disallowedSet := make(map[string]bool, len(a.opts.DisallowedTools))
-		for _, name := range a.opts.DisallowedTools {
-			disallowedSet[name] = true
-		}
-		var filtered []types.Tool
-		for _, t := range allTools {
-			if !disallowedSet[t.Name()] {
-				filtered = append(filtered, t)
-			}
-		}
-		allTools = filtered
-	}
+	// Apply the same immutable tool bounds to model-visible schemas that the
+	// executor enforces again against the concrete registry tool.
+	allTools := permissions.FilterTools(a.toolRegistry.All(), a.opts.AllowedTools, a.opts.DisallowedTools)
 	apiTools := make([]api.APIToolParam, len(allTools))
 	for i, t := range allTools {
 		apiTools[i] = api.ToolToAPIParam(t)

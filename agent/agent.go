@@ -202,10 +202,7 @@ func New(opts Options) *Agent {
 	if permConfig.Mode == "" {
 		permConfig.Mode = types.PermissionModeBypassPermissions
 	}
-	canUseTool := opts.CanUseTool
-	if canUseTool == nil {
-		canUseTool = permissions.NewCanUseToolFn(permConfig, opts.AllowedTools)
-	}
+	canUseTool := permissions.NewPolicy(permConfig, opts.AllowedTools, opts.DisallowedTools, opts.CanUseTool)
 
 	hookManager := hooks.NewManager(opts.Hooks)
 

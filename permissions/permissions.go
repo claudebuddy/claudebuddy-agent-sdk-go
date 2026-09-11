@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/claudebuddy/claudebuddy-agent-sdk-go/tools"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/types"
 )
 
@@ -120,71 +121,164 @@ func DefaultConfig() *Config {
 	}
 }
 
-// NewCanUseToolFn creates a CanUseToolFn from a permission config.
+// NewCanUseToolFn creates a CanUseToolFn from a permission config. It is kept
+// for compatibility; callers that need deny bounds or a host callback should
+// use NewPolicy.
 func NewCanUseToolFn(config *Config, allowedTools []string) types.CanUseToolFn {
-	allowedSet := make(map[string]bool, len(allowedTools))
-	for _, t := range allowedTools {
-		allowedSet[t] = true
-	}
+	return NewPolicy(config, allowedTools, nil, nil)
+}
+
+// NewPolicy composes immutable tool bounds, dynamic rules, permission mode,
+// and an optional host callback into one execution-time policy.
+func NewPolicy(
+	config *Config,
+	allowedTools []string,
+	deniedTools []string,
+	callback types.CanUseToolFn,
+) types.CanUseToolFn {
+	allowedSet := toolNameSet(allowedTools)
+	deniedSet := toolNameSet(deniedTools)
+	hasAllowBound := allowedTools != nil
 
 	return func(tool types.Tool, input map[string]interface{}) (*types.PermissionDecision, error) {
+		if tool == nil {
+			return deny("Tool is unavailable"), nil
+		}
+
 		toolName := tool.Name()
+		mode, allowRules, denyRules := permissionSnapshot(config)
 
-		config.mu.RLock()
-		denyRules := append([]Rule(nil), config.DenyRules...)
-		allowRules := append([]Rule(nil), config.AllowRules...)
-		mode := config.Mode
-		config.mu.RUnlock()
-
-		// Check deny rules first
-		for _, rule := range denyRules {
-			if matchesRule(rule, toolName, input) {
-				return &types.PermissionDecision{
-					Behavior: types.PermissionDeny,
-					Reason:   "Denied by rule: " + rule.ToolName,
-				}, nil
-			}
+		if deniedSet[toolName] {
+			return deny("Tool is in denied list"), nil
+		}
+		if rule := firstMatchingRule(denyRules, toolName, input); rule != nil {
+			return deny("Denied by rule: " + rule.ToolName), nil
+		}
+		if hasAllowBound && !allowedSet[toolName] {
+			return deny("Tool not in allowed list"), nil
+		}
+		if mode == types.PermissionModePlan && !tool.IsReadOnly(input) {
+			return deny("Plan mode only allows read-only tools"), nil
 		}
 
-		// Check allow rules
-		for _, rule := range allowRules {
-			if matchesRule(rule, toolName, input) {
-				return &types.PermissionDecision{
-					Behavior: types.PermissionAllow,
-				}, nil
-			}
-		}
-
-		// Check allowedTools set
-		if len(allowedSet) > 0 {
-			if !allowedSet[toolName] {
-				if mode == types.PermissionModeBypassPermissions {
-					return &types.PermissionDecision{Behavior: types.PermissionAllow}, nil
-				}
-				return &types.PermissionDecision{
-					Behavior: types.PermissionDeny,
-					Reason:   "Tool not in allowed list",
-				}, nil
-			}
-		}
-
-		// Apply permission mode
-		switch mode {
-		case types.PermissionModeBypassPermissions:
-			return &types.PermissionDecision{Behavior: types.PermissionAllow}, nil
-		case types.PermissionModeDontAsk:
-			return &types.PermissionDecision{Behavior: types.PermissionAllow}, nil
-		case types.PermissionModeAcceptEdits:
-			if tool.IsReadOnly(input) || isFileEditTool(toolName) {
+		preapproved := isPreapproved(tool, input, mode, hasAllowBound && allowedSet[toolName], allowRules)
+		callbackEligible := preapproved || mode == types.PermissionModeDefault || mode == types.PermissionModeAcceptEdits
+		if callback == nil || !callbackEligible {
+			if preapproved {
 				return &types.PermissionDecision{Behavior: types.PermissionAllow}, nil
 			}
-			return &types.PermissionDecision{Behavior: types.PermissionAllow}, nil
-		case types.PermissionModePlan:
-			return &types.PermissionDecision{Behavior: types.PermissionAllow}, nil
-		default:
-			return &types.PermissionDecision{Behavior: types.PermissionAllow}, nil
+			return deny("Permission denied"), nil
+		}
+
+		decision, err := callback(tool, input)
+		if decision == nil {
+			decision = deny("Permission callback returned no decision")
+		}
+		if err != nil {
+			return decision, err
+		}
+
+		checkedInput := input
+		if decision.UpdatedInput != nil {
+			checkedInput = decision.UpdatedInput
+		}
+		if rule := firstMatchingRule(denyRules, toolName, checkedInput); rule != nil {
+			return deny("Denied by rule: " + rule.ToolName), nil
+		}
+		if mode == types.PermissionModePlan && !tool.IsReadOnly(checkedInput) {
+			return deny("Plan mode only allows read-only tools"), nil
+		}
+		if mode == types.PermissionModeDontAsk && !isPreapproved(tool, checkedInput, mode, hasAllowBound && allowedSet[toolName], allowRules) {
+			return deny("Permission denied"), nil
+		}
+		if decision.Behavior != types.PermissionAllow {
+			decision.Behavior = types.PermissionDeny
+			if decision.Reason == "" {
+				decision.Reason = "Permission denied"
+			}
+		}
+		return decision, nil
+	}
+}
+
+// FilterTools applies immutable visibility bounds while preserving input order.
+// A nil allow list means no allow bound; a non-nil empty list exposes no tools.
+func FilterTools(allTools []types.Tool, allowedTools []string, deniedTools []string) []types.Tool {
+	allowedSet := toolNameSet(allowedTools)
+	deniedSet := toolNameSet(deniedTools)
+	hasAllowBound := allowedTools != nil
+
+	filtered := make([]types.Tool, 0, len(allTools))
+	for _, tool := range allTools {
+		if tool == nil || deniedSet[tool.Name()] {
+			continue
+		}
+		if hasAllowBound && !allowedSet[tool.Name()] {
+			continue
+		}
+		filtered = append(filtered, tool)
+	}
+	return filtered
+}
+
+func toolNameSet(names []string) map[string]bool {
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		set[name] = true
+	}
+	return set
+}
+
+func permissionSnapshot(config *Config) (types.PermissionMode, []Rule, []Rule) {
+	if config == nil {
+		return types.PermissionModeBypassPermissions, nil, nil
+	}
+	config.mu.RLock()
+	defer config.mu.RUnlock()
+
+	mode := config.Mode
+	if mode == "" {
+		mode = types.PermissionModeDefault
+	}
+	return mode, append([]Rule(nil), config.AllowRules...), append([]Rule(nil), config.DenyRules...)
+}
+
+func firstMatchingRule(rules []Rule, toolName string, input map[string]interface{}) *Rule {
+	for i := range rules {
+		if matchesRule(rules[i], toolName, input) {
+			return &rules[i]
 		}
 	}
+	return nil
+}
+
+func isPreapproved(
+	tool types.Tool,
+	input map[string]interface{},
+	mode types.PermissionMode,
+	explicitlyAllowed bool,
+	allowRules []Rule,
+) bool {
+	if tool.IsReadOnly(input) || explicitlyAllowed || mode == types.PermissionModeBypassPermissions {
+		return true
+	}
+	if mode == types.PermissionModeAcceptEdits && isBuiltInEditTool(tool) {
+		return true
+	}
+	return firstMatchingRule(allowRules, tool.Name(), input) != nil
+}
+
+func isBuiltInEditTool(tool types.Tool) bool {
+	switch tool.(type) {
+	case *tools.FileEditTool, *tools.FileWriteTool, *tools.NotebookEditTool:
+		return true
+	default:
+		return false
+	}
+}
+
+func deny(reason string) *types.PermissionDecision {
+	return &types.PermissionDecision{Behavior: types.PermissionDeny, Reason: reason}
 }
 
 // matchesRule checks if a rule matches the tool and input.
@@ -233,8 +327,4 @@ func simpleWildcardMatch(pattern, value string) bool {
 	}
 
 	return pattern == value
-}
-
-func isFileEditTool(name string) bool {
-	return name == "Edit" || name == "Write" || name == "Read" || name == "Glob" || name == "Grep"
 }
