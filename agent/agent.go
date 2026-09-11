@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 )
 
 const (
-	defaultMaxTurns = 100
+	defaultMaxTurns = 10
 )
 
 // ThinkingType represents the type of thinking configuration.
@@ -53,6 +54,9 @@ const (
 
 // Options configures an Agent.
 type Options struct {
+	// ProviderClient overrides the default API client.
+	ProviderClient api.MessageProvider
+
 	// Model ID (e.g. "sonnet-4-6")
 	Model string
 
@@ -158,7 +162,8 @@ type AgentDefinition struct {
 // Agent is the main agent that runs the agentic loop.
 type Agent struct {
 	opts         Options
-	apiClient    *api.Client
+	provider     api.MessageProvider
+	initErr      error
 	toolRegistry *tools.Registry
 	mcpClient    *mcp.Client
 	costTracker  *costtracker.Tracker
@@ -171,18 +176,22 @@ type Agent struct {
 // New creates a new Agent.
 func New(opts Options) *Agent {
 	resolveEnvOptions(&opts)
+	initErr := opts.Validate()
 
 	sessionID := uuid.New().String()
 
-	apiClient := api.NewClient(api.ClientConfig{
-		APIKey:        opts.APIKey,
-		BaseURL:       opts.BaseURL,
-		Model:         opts.Model,
-		Provider:      api.Provider(opts.Provider),
-		CustomHeaders: opts.CustomHeaders,
-		ProxyURL:      opts.ProxyURL,
-		TimeoutMs:     opts.TimeoutMs,
-	})
+	provider := opts.ProviderClient
+	if provider == nil {
+		provider = api.NewClient(api.ClientConfig{
+			APIKey:        opts.APIKey,
+			BaseURL:       opts.BaseURL,
+			Model:         opts.Model,
+			Provider:      api.Provider(opts.Provider),
+			CustomHeaders: opts.CustomHeaders,
+			ProxyURL:      opts.ProxyURL,
+			TimeoutMs:     opts.TimeoutMs,
+		})
+	}
 
 	registry := tools.DefaultRegistry()
 	for _, t := range opts.CustomTools {
@@ -202,7 +211,8 @@ func New(opts Options) *Agent {
 
 	a := &Agent{
 		opts:         opts,
-		apiClient:    apiClient,
+		provider:     provider,
+		initErr:      initErr,
 		toolRegistry: registry,
 		mcpClient:    mcp.NewClient(),
 		costTracker:  costtracker.NewTracker(sessionID),
@@ -278,6 +288,10 @@ func (a *Agent) Query(ctx context.Context, prompt string) (<-chan types.SDKMessa
 	go func() {
 		defer close(eventCh)
 		defer close(errCh)
+		if a.initErr != nil {
+			errCh <- a.initErr
+			return
+		}
 
 		err := a.runLoop(ctx, prompt, eventCh)
 		if err != nil {
@@ -286,6 +300,34 @@ func (a *Agent) Query(ctx context.Context, prompt string) (<-chan types.SDKMessa
 	}()
 
 	return eventCh, errCh
+}
+
+// Validate checks whether Options contains supported values.
+func (o Options) Validate() error {
+	if o.MaxTurns < 0 {
+		return fmt.Errorf("%w: max turns must be positive", ErrInvalidOptions)
+	}
+	if math.IsNaN(o.MaxBudgetUSD) || math.IsInf(o.MaxBudgetUSD, 0) || o.MaxBudgetUSD < 0 {
+		return fmt.Errorf("%w: max budget must be finite and non-negative", ErrInvalidOptions)
+	}
+	if o.TimeoutMs < 0 {
+		return fmt.Errorf("%w: timeout must be positive when specified", ErrInvalidOptions)
+	}
+	return validatePermissionMode(o.PermissionMode)
+}
+
+func validatePermissionMode(mode types.PermissionMode) error {
+	switch mode {
+	case "",
+		types.PermissionModeDefault,
+		types.PermissionModeAcceptEdits,
+		types.PermissionModeBypassPermissions,
+		types.PermissionModePlan,
+		types.PermissionModeDontAsk:
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported permission mode %q", ErrInvalidOptions, mode)
+	}
 }
 
 // Prompt runs a query and returns the final result (blocking).

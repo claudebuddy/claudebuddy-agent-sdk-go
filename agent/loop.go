@@ -126,6 +126,7 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 
 		// Call the API
 		req := api.MessagesRequest{
+			Model:    a.opts.Model,
 			System:   apiSystemBlocks,
 			Messages: apiMessages,
 			Tools:    apiTools,
@@ -174,7 +175,7 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 			}
 		}
 
-		streamEvents, streamErr := a.apiClient.CreateMessageStream(ctx, req)
+		streamEvents, streamErr := a.provider.CreateMessageStream(ctx, req)
 
 		// Accumulate the assistant response
 		assistantMsg := &types.Message{
@@ -209,9 +210,7 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 		}
 
 		// If stream failed and fallback model is configured, retry with fallback
-		if streamError != nil && a.opts.FallbackModel != "" && a.apiClient.Model() != a.opts.FallbackModel {
-			a.apiClient.SetModel(a.opts.FallbackModel)
-
+		if streamError != nil && a.opts.FallbackModel != "" && req.Model != a.opts.FallbackModel {
 			// Reset assistant message for retry
 			assistantMsg = &types.Message{
 				Type:      types.MessageTypeAssistant,
@@ -221,7 +220,9 @@ func (a *Agent) runLoop(ctx context.Context, prompt string, eventCh chan<- types
 			}
 			toolUseBlocks = nil
 
-			streamEvents, streamErr = a.apiClient.CreateMessageStream(ctx, req)
+			fallbackReq := req
+			fallbackReq.Model = a.opts.FallbackModel
+			streamEvents, streamErr = a.provider.CreateMessageStream(ctx, fallbackReq)
 			streamError = nil
 
 		fallbackStreamLoop:

@@ -73,6 +73,8 @@ type Client struct {
 	config ClientConfig
 }
 
+var _ MessageProvider = (*Client)(nil)
+
 // envOr returns the first non-empty value from environment variables,
 // trying CLAUDEBUDDY_ prefix first then ANTHROPIC_ for compatibility.
 func envOr(keys ...string) string {
