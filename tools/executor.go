@@ -18,9 +18,11 @@ type ToolCallRequest struct {
 
 // ToolCallResponse is the result of a tool call execution.
 type ToolCallResponse struct {
-	ToolUseID string
-	Result    *types.ToolResult
-	Error     error
+	ToolUseID        string
+	ToolName         string
+	Result           *types.ToolResult
+	Error            error
+	PermissionDenial *types.PermissionDenial
 }
 
 // Executor runs tool calls with concurrency management.
@@ -154,6 +156,7 @@ func fillCancellationResults(
 func cancellationResponse(call ToolCallRequest, err error) ToolCallResponse {
 	return ToolCallResponse{
 		ToolUseID: call.ToolUseID,
+		ToolName:  call.ToolName,
 		Result: &types.ToolResult{
 			IsError: true,
 			Error:   err.Error(),
@@ -175,6 +178,7 @@ func (e *Executor) runSingle(ctx context.Context, call ToolCallRequest) ToolCall
 	if tool == nil {
 		return ToolCallResponse{
 			ToolUseID: call.ToolUseID,
+			ToolName:  call.ToolName,
 			Result: &types.ToolResult{
 				IsError: true,
 				Error:   "Unknown tool: " + call.ToolName,
@@ -192,6 +196,7 @@ func (e *Executor) runSingle(ctx context.Context, call ToolCallRequest) ToolCall
 		if err != nil {
 			return ToolCallResponse{
 				ToolUseID: call.ToolUseID,
+				ToolName:  call.ToolName,
 				Result: &types.ToolResult{
 					IsError: true,
 					Error:   "Permission check failed: " + err.Error(),
@@ -204,7 +209,9 @@ func (e *Executor) runSingle(ctx context.Context, call ToolCallRequest) ToolCall
 				reason = "Permission denied"
 			}
 			return ToolCallResponse{
-				ToolUseID: call.ToolUseID,
+				ToolUseID:        call.ToolUseID,
+				ToolName:         call.ToolName,
+				PermissionDenial: &types.PermissionDenial{Tool: call.ToolName, Reason: reason},
 				Result: &types.ToolResult{
 					IsError: true,
 					Error:   reason,
@@ -229,6 +236,7 @@ func (e *Executor) runSingle(ctx context.Context, call ToolCallRequest) ToolCall
 	if err != nil {
 		return ToolCallResponse{
 			ToolUseID: call.ToolUseID,
+			ToolName:  call.ToolName,
 			Result: &types.ToolResult{
 				IsError: true,
 				Error:   err.Error(),
@@ -242,6 +250,7 @@ func (e *Executor) runSingle(ctx context.Context, call ToolCallRequest) ToolCall
 
 	return ToolCallResponse{
 		ToolUseID: call.ToolUseID,
+		ToolName:  call.ToolName,
 		Result:    result,
 	}
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/api"
 	agentcontext "github.com/claudebuddy/claudebuddy-agent-sdk-go/context"
+	"github.com/claudebuddy/claudebuddy-agent-sdk-go/costtracker"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/permissions"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/tools"
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/types"
@@ -26,8 +27,6 @@ func (r *Run) runLoop(prompt string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	startTime := time.Now()
-
 	// Build system prompt
 	systemPrompt := a.opts.SystemPrompt
 	if systemPrompt == "" {
@@ -89,26 +88,15 @@ func (r *Run) runLoop(prompt string) error {
 	// Create tool executor
 	executor := tools.NewExecutorWithOptions(tools.ExecutorOptions{Registry: s.registry, CanUseTool: a.canUseTool, ToolContext: toolCtx, MaxConcurrency: a.opts.MaxConcurrentTools})
 
-	var totalUsage types.Usage
 	turn := 0
 
 	// Main loop
 	for turn < a.opts.MaxTurns {
-		if err := ctx.Err(); err != nil {
+		if err := r.checkAdmission(); err != nil {
 			return err
 		}
 		turn++
-
-		// Check budget
-		if a.opts.MaxBudgetUSD > 0 && s.costTracker.TotalCost() >= a.opts.MaxBudgetUSD {
-			if err := r.emit(types.SDKMessage{
-				Type: types.MessageTypeSystem,
-				Text: fmt.Sprintf("Budget limit reached ($%.2f)", a.opts.MaxBudgetUSD),
-			}); err != nil {
-				return err
-			}
-			break
-		}
+		r.result.NumTurns = turn
 
 		// Build API messages from conversation history
 		apiMessages := s.buildAPIMessages()
@@ -173,6 +161,7 @@ func (r *Run) runLoop(prompt string) error {
 		}
 
 		var toolUseBlocks []types.ToolUseBlock
+		usedModel := req.Model
 		streamError := r.readStream(req, assistantMsg, &toolUseBlocks)
 
 		// If stream failed and fallback model is configured, retry with fallback
@@ -191,18 +180,18 @@ func (r *Run) runLoop(prompt string) error {
 			if err := r.readStream(fallbackReq, assistantMsg, &toolUseBlocks); err != nil {
 				return fmt.Errorf("API stream error (fallback model %s): %w", a.opts.FallbackModel, err)
 			}
+			usedModel = fallbackReq.Model
 		} else if streamError != nil {
 			return fmt.Errorf("API stream error: %w", streamError)
 		}
 
 		// Update usage
 		if assistantMsg.Usage != nil {
-			totalUsage.InputTokens += assistantMsg.Usage.InputTokens
-			totalUsage.OutputTokens += assistantMsg.Usage.OutputTokens
-			totalUsage.CacheReadInputTokens += assistantMsg.Usage.CacheReadInputTokens
-			totalUsage.CacheCreationInputTokens += assistantMsg.Usage.CacheCreationInputTokens
-			s.costTracker.AddUsage(a.opts.Model, assistantMsg.Usage)
+			cost := costtracker.EstimateCost(usedModel, assistantMsg.Usage)
+			r.ledger.Add(usedModel, *assistantMsg.Usage, cost)
+			s.costTracker.AddUsage(usedModel, assistantMsg.Usage)
 		}
+		r.result.StopReason = assistantMsg.StopReason
 
 		// Store assistant message
 		s.appendMessage(*assistantMsg)
@@ -218,15 +207,14 @@ func (r *Run) runLoop(prompt string) error {
 		// Check if we need to run tools
 		if len(toolUseBlocks) == 0 {
 			// No tool calls — end of turn
-			break
+			return nil
 		}
 
 		// Check stop reason
-		if assistantMsg.StopReason == "end_turn" && len(toolUseBlocks) == 0 {
-			break
-		}
-
 		// Execute tools
+		if err := r.checkAdmission(); err != nil {
+			return err
+		}
 		toolCalls := make([]tools.ToolCallRequest, len(toolUseBlocks))
 		for i, tb := range toolUseBlocks {
 			toolCalls[i] = tools.ToolCallRequest{
@@ -237,6 +225,11 @@ func (r *Run) runLoop(prompt string) error {
 		}
 
 		results := executor.RunTools(ctx, toolCalls)
+		for _, result := range results {
+			if result.PermissionDenial != nil {
+				r.result.PermissionDenials = append(r.result.PermissionDenials, *result.PermissionDenial)
+			}
+		}
 
 		// Build tool result message
 		var toolResultContent []types.ContentBlock
@@ -301,15 +294,7 @@ func (r *Run) runLoop(prompt string) error {
 		}
 	}
 
-	// Emit result
-	return r.emit(types.SDKMessage{
-		Type:     types.MessageTypeResult,
-		Text:     r.result.Text,
-		Usage:    &totalUsage,
-		NumTurns: turn,
-		Duration: time.Since(startTime).Milliseconds(),
-		Cost:     s.costTracker.TotalCost(),
-	})
+	return ErrMaxTurns
 }
 
 // readStream ignores closed error channels until buffered events are consumed.

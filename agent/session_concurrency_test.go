@@ -23,6 +23,7 @@ import (
 // below are the real runtime. Every blocking fixture observes the test context.
 type sessionProvider struct {
 	respond func(context.Context, api.MessagesRequest) ([]types.ContentBlock, error)
+	usage   *types.Usage
 }
 
 func (p *sessionProvider) CreateMessage(ctx context.Context, req api.MessagesRequest) (*api.StreamMessage, error) {
@@ -35,7 +36,7 @@ func (p *sessionProvider) CreateMessageStream(ctx context.Context, req api.Messa
 	if err != nil {
 		errs <- err
 	} else {
-		events <- api.StreamEvent{Type: "message_start", Message: &api.StreamMessage{Role: "assistant", Model: req.Model}}
+		events <- api.StreamEvent{Type: "message_start", Message: &api.StreamMessage{Role: "assistant", Model: req.Model, Usage: p.usage}}
 		for i := range blocks {
 			b := blocks[i]
 			events <- api.StreamEvent{Type: "content_block_start", Index: i, ContentBlock: &b}

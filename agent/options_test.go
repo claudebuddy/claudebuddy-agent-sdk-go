@@ -187,6 +187,9 @@ func TestOptionsValidateRejectsInvalidValues(t *testing.T) {
 	}{
 		{name: "negative max turns", opts: Options{MaxTurns: -1}},
 		{name: "negative budget", opts: Options{MaxBudgetUSD: -0.01}},
+		{name: "negative preferred budget", opts: Options{Budget: &BudgetOptions{MaxUSD: -0.01}}},
+		{name: "NaN preferred budget", opts: Options{Budget: &BudgetOptions{MaxUSD: math.NaN()}}},
+		{name: "infinite preferred budget", opts: Options{Budget: &BudgetOptions{MaxUSD: math.Inf(1)}}},
 		{name: "NaN budget", opts: Options{MaxBudgetUSD: math.NaN()}},
 		{name: "positive infinite budget", opts: Options{MaxBudgetUSD: math.Inf(1)}},
 		{name: "negative infinite budget", opts: Options{MaxBudgetUSD: math.Inf(-1)}},

@@ -92,6 +92,15 @@ type Options struct {
 	// Maximum USD budget per query
 	MaxBudgetUSD float64
 
+	// Budget is the preferred Run budget. A non-nil zero value prevents the
+	// first model admission; MaxBudgetUSD remains a positive-only compatibility
+	// field and is ignored when Budget is present.
+	Budget *BudgetOptions
+
+	// sharedLedger is set only for child Agents so their model calls charge the
+	// owning parent Run. It is deliberately not part of the public contract.
+	sharedLedger *costtracker.Ledger
+
 	// Permission mode
 	PermissionMode types.PermissionMode
 
@@ -171,6 +180,12 @@ type AgentDefinition struct {
 	InitialPrompt   string                           `json:"initialPrompt,omitempty"`
 }
 
+// BudgetOptions configures a hard admission threshold for approximate cost.
+// Concurrent in-flight requests may overshoot an estimate.
+type BudgetOptions struct {
+	MaxUSD float64 `json:"max_usd"`
+}
+
 // Agent is the main agent that runs the agentic loop.
 type Agent struct {
 	opts           Options
@@ -212,6 +227,10 @@ func New(opts Options) *Agent {
 	if opts.Thinking != nil {
 		thinking := *opts.Thinking
 		opts.Thinking = &thinking
+	}
+	if opts.Budget != nil {
+		budget := *opts.Budget
+		opts.Budget = &budget
 	}
 	if opts.JSONSchema != nil {
 		opts.JSONSchema = cloneCollection(reflect.ValueOf(opts.JSONSchema)).Interface().(map[string]interface{})
@@ -343,12 +362,18 @@ func (a *Agent) Init(ctx context.Context) error {
 
 // QueryResult is the final result of a query.
 type QueryResult struct {
-	Text     string          `json:"text"`
-	Usage    types.Usage     `json:"usage"`
-	NumTurns int             `json:"num_turns"`
-	Duration time.Duration   `json:"duration"`
-	Messages []types.Message `json:"messages"`
-	Cost     float64         `json:"cost"`
+	Text              string                   `json:"text"`
+	Subtype           types.ResultSubtype      `json:"subtype"`
+	IsError           bool                     `json:"is_error"`
+	Errors            []string                 `json:"errors,omitempty"`
+	StopReason        string                   `json:"stop_reason,omitempty"`
+	Usage             types.Usage              `json:"usage"`
+	ModelUsage        map[string]types.Usage   `json:"model_usage,omitempty"`
+	PermissionDenials []types.PermissionDenial `json:"permission_denials,omitempty"`
+	NumTurns          int                      `json:"num_turns"`
+	Duration          time.Duration            `json:"duration"`
+	Messages          []types.Message          `json:"messages"`
+	Cost              float64                  `json:"cost"`
 }
 
 // Query runs the agentic loop with streaming events.
@@ -363,6 +388,9 @@ func (o Options) Validate() error {
 	}
 	if math.IsNaN(o.MaxBudgetUSD) || math.IsInf(o.MaxBudgetUSD, 0) || o.MaxBudgetUSD < 0 {
 		return fmt.Errorf("%w: max budget must be finite and non-negative", ErrInvalidOptions)
+	}
+	if o.Budget != nil && (math.IsNaN(o.Budget.MaxUSD) || math.IsInf(o.Budget.MaxUSD, 0) || o.Budget.MaxUSD < 0) {
+		return fmt.Errorf("%w: budget max USD must be finite and non-negative", ErrInvalidOptions)
 	}
 	if o.TimeoutMs < 0 {
 		return fmt.Errorf("%w: timeout must be positive when specified", ErrInvalidOptions)
@@ -444,6 +472,8 @@ func (a *Agent) spawnSubagentWithTracker(ctx context.Context, config tools.Subag
 		BaseURL:         a.opts.BaseURL,
 		CWD:             config.CWD,
 		MaxTurns:        30,
+		MaxBudgetUSD:    a.opts.MaxBudgetUSD,
+		Budget:          a.opts.Budget,
 		PermissionMode:  a.opts.PermissionMode,
 		AllowedTools:    intersectToolBounds(a.opts.AllowedTools, config.Tools),
 		DisallowedTools: unionToolBounds(a.opts.DisallowedTools, childDeniedTools),
@@ -451,6 +481,7 @@ func (a *Agent) spawnSubagentWithTracker(ctx context.Context, config tools.Subag
 		CustomHeaders:   a.opts.CustomHeaders,
 		ProxyURL:        a.opts.ProxyURL,
 		TimeoutMs:       a.opts.TimeoutMs,
+		sharedLedger:    ledgerFromContext(ctx),
 	}
 
 	if childOpts.CWD == "" {
@@ -472,17 +503,20 @@ func (a *Agent) spawnSubagentWithTracker(ctx context.Context, config tools.Subag
 	}
 
 	result, err := child.Prompt(ctx, config.Prompt)
+	// Session aggregates include child usage even when the child terminates with
+	// an error. The shared Run ledger was already charged at model completion.
+	if tracker != nil {
+		for childModel, usage := range child.CostTracker().AllModelUsage() {
+			tracker.AddUsage(childModel, &types.Usage{
+				InputTokens:              usage.InputTokens,
+				OutputTokens:             usage.OutputTokens,
+				CacheReadInputTokens:     usage.CacheReadInputTokens,
+				CacheCreationInputTokens: usage.CacheCreationInputTokens,
+			})
+		}
+	}
 	if err != nil {
 		return "", err
-	}
-
-	// Merge cost into parent tracker
-	if tracker != nil {
-		childIn, childOut := child.CostTracker().TotalTokens()
-		tracker.AddUsage(model, &types.Usage{
-			InputTokens:  childIn,
-			OutputTokens: childOut,
-		})
 	}
 
 	return result.Text, nil
