@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,9 +43,16 @@ type Connection struct {
 	baseURL    string
 
 	// JSON-RPC state
-	nextID int
-	mu     sync.Mutex
+	nextID      int
+	mu          sync.Mutex
+	requestGate chan struct{}
+	closed      chan struct{}
+	closing     bool
+	closeOnce   sync.Once
+	requests    sync.WaitGroup
 }
+
+var ErrConnectionClosed = errors.New("MCP connection is closed")
 
 // JSONRPCRequest is a JSON-RPC 2.0 request.
 type JSONRPCRequest struct {
@@ -112,20 +120,31 @@ func (c *Client) ConnectServer(ctx context.Context, name string, config types.MC
 	if err != nil {
 		conn.Status = types.MCPStatusError
 		conn.Error = fmt.Sprintf("failed to list tools: %v", err)
+		conn.cleanup()
+		return conn, fmt.Errorf("list tools: %w", err)
 	} else {
 		conn.Tools = tools
 	}
 
 	c.mu.Lock()
+	previous := c.connections[name]
 	c.connections[name] = conn
 	c.mu.Unlock()
+	if previous != nil && previous.cleanup != nil {
+		previous.cleanup()
+	}
 
 	return conn, nil
 }
 
 // connectStdio connects to an MCP server via stdio.
 func (c *Client) connectStdio(ctx context.Context, name string, config types.MCPServerConfig) (*Connection, error) {
-	cmd := exec.CommandContext(ctx, config.Command, config.Args...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// The Connection owns the process. Initialization context cancellation is
+	// handled by the request path and must not kill a successfully initialized server.
+	cmd := exec.Command(config.Command, config.Args...)
 
 	// Set environment
 	cmd.Env = os.Environ()
@@ -140,12 +159,15 @@ func (c *Client) connectStdio(ctx context.Context, name string, config types.MCP
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		stdin.Close()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		stdout.Close()
 		return nil, fmt.Errorf("start process: %w", err)
 	}
 
@@ -157,19 +179,15 @@ func (c *Client) connectStdio(ctx context.Context, name string, config types.MCP
 		stdin:  stdin,
 		stdout: stdout,
 		reader: bufio.NewReader(stdout),
-		cleanup: func() {
-			stdin.Close()
-			cmd.Process.Kill()
-			cmd.Wait()
-		},
 	}
+	conn.cleanup = conn.closeAndWait
 
 	// Send initialize request
 	initResult, err := conn.sendRequest(ctx, "initialize", map[string]interface{}{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]interface{}{
-			"name":    "open-agent-sdk-go",
+			"name":    "claudebuddy-agent-sdk-go",
 			"version": "0.1.0",
 		},
 	})
@@ -179,7 +197,10 @@ func (c *Client) connectStdio(ctx context.Context, name string, config types.MCP
 	}
 
 	// Send initialized notification
-	_ = conn.sendNotification("notifications/initialized", nil)
+	if err := conn.sendNotification("notifications/initialized", nil); err != nil {
+		conn.cleanup()
+		return nil, err
+	}
 
 	_ = initResult
 	return conn, nil
@@ -193,8 +214,8 @@ func (c *Client) connectHTTP(ctx context.Context, name string, config types.MCPS
 		Status:     types.MCPStatusConnected,
 		httpClient: &http.Client{Timeout: 60 * time.Second},
 		baseURL:    strings.TrimRight(config.URL, "/"),
-		cleanup:    func() {},
 	}
+	conn.cleanup = conn.closeAndWait
 
 	return conn, nil
 }
@@ -238,13 +259,43 @@ func (c *Client) AllTools() []types.MCPToolDefinition {
 // Close disconnects all servers.
 func (c *Client) Close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, conn := range c.connections {
+	connections := c.connections
+	c.connections = make(map[string]*Connection)
+	c.mu.Unlock()
+	for _, conn := range connections {
 		if conn.cleanup != nil {
 			conn.cleanup()
 		}
 	}
-	c.connections = make(map[string]*Connection)
+}
+
+func (conn *Connection) closeAndWait() { conn.closeTransport(); conn.requests.Wait() }
+
+// closeTransport poisons the synchronous transport before unblocking I/O. It
+// does not join requests itself because the active request may initiate cleanup.
+func (conn *Connection) closeTransport() {
+	conn.closeOnce.Do(func() {
+		conn.mu.Lock()
+		conn.closing = true
+		if conn.closed == nil {
+			conn.closed = make(chan struct{})
+		}
+		close(conn.closed)
+		conn.mu.Unlock()
+		if conn.stdin != nil {
+			conn.stdin.Close()
+		}
+		if conn.stdout != nil {
+			conn.stdout.Close()
+		}
+		if conn.cmd != nil && conn.cmd.Process != nil {
+			conn.cmd.Process.Kill()
+			conn.cmd.Wait()
+		}
+		if conn.httpClient != nil {
+			conn.httpClient.CloseIdleConnections()
+		}
+	})
 }
 
 // ListTools fetches the list of available tools from the server.
@@ -310,10 +361,43 @@ func (conn *Connection) CallTool(ctx context.Context, toolName string, input map
 
 // sendRequest sends a JSON-RPC request and waits for a response.
 func (conn *Connection) sendRequest(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	conn.mu.Lock()
+	if conn.closing {
+		conn.mu.Unlock()
+		return nil, ErrConnectionClosed
+	}
+	if conn.requestGate == nil {
+		conn.requestGate = make(chan struct{}, 1)
+	}
+	if conn.closed == nil {
+		conn.closed = make(chan struct{})
+	}
+	gate, closed := conn.requestGate, conn.closed
+	conn.requests.Add(1)
+	conn.mu.Unlock()
+	defer conn.requests.Done()
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-closed:
+		return nil, ErrConnectionClosed
+	}
+	defer func() { <-gate }()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-closed:
+		return nil, ErrConnectionClosed
+	default:
+	}
+	// One connection has one active exchange; no mutex spans transport I/O.
 	conn.nextID++
 	id := conn.nextID
-	conn.mu.Unlock()
 
 	req := JSONRPCRequest{
 		JSONRPC: "2.0",
@@ -329,7 +413,20 @@ func (conn *Connection) sendRequest(ctx context.Context, method string, params i
 
 	// HTTP transport
 	if conn.httpClient != nil {
-		return conn.sendHTTPRequest(ctx, req)
+		requestCtx, cancel := context.WithCancel(ctx)
+		joined := make(chan struct{})
+		go func() {
+			defer close(joined)
+			select {
+			case <-closed:
+				cancel()
+			case <-requestCtx.Done():
+			}
+		}()
+		result, err := conn.sendHTTPRequest(requestCtx, req)
+		cancel()
+		<-joined
+		return result, err
 	}
 
 	return nil, fmt.Errorf("no transport available")
@@ -341,25 +438,30 @@ func (conn *Connection) sendStdioRequest(ctx context.Context, req JSONRPCRequest
 		return nil, err
 	}
 
-	// Write request
-	if _, err := conn.stdin.Write(append(data, '\n')); err != nil {
-		return nil, fmt.Errorf("write request: %w", err)
-	}
-
-	// Read response (blocking, with context cancellation via goroutine)
+	// The active request owns this I/O worker. Cancellation closes both pipes,
+	// poisons the connection and joins the worker before releasing its gate.
 	type readResult struct {
 		line []byte
 		err  error
 	}
 	ch := make(chan readResult, 1)
 	go func() {
+		if _, err := conn.stdin.Write(append(data, '\n')); err != nil {
+			ch <- readResult{err: fmt.Errorf("write request: %w", err)}
+			return
+		}
 		line, err := conn.reader.ReadBytes('\n')
 		ch <- readResult{line, err}
 	}()
 
 	select {
 	case <-ctx.Done():
+		conn.closeTransport()
+		<-ch
 		return nil, ctx.Err()
+	case <-conn.closed:
+		<-ch
+		return nil, ErrConnectionClosed
 	case r := <-ch:
 		if r.err != nil {
 			return nil, fmt.Errorf("read response: %w", r.err)

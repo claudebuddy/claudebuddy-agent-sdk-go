@@ -1,6 +1,9 @@
 package types
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // PermissionBehavior represents a permission decision.
 type PermissionBehavior string
@@ -79,6 +82,46 @@ type ToolUseContext struct {
 
 	// ReadFileState tracks file read state for staleness detection.
 	ReadFileState map[string]*FileReadState
+
+	// ReadFileStateMu protects the map when shared by concurrent tools. Copies
+	// of this context must keep this pointer with the same map. Legacy contexts
+	// without a mutex remain supported for serial use only; direct map access
+	// must not race with the helpers.
+	ReadFileStateMu *sync.RWMutex
+}
+
+// GetFileReadState returns a value snapshot without retaining a lock over I/O.
+func (c *ToolUseContext) GetFileReadState(path string) (*FileReadState, bool) {
+	if c == nil {
+		return nil, false
+	}
+	if c.ReadFileStateMu != nil {
+		c.ReadFileStateMu.RLock()
+		defer c.ReadFileStateMu.RUnlock()
+	}
+	state, ok := c.ReadFileState[path]
+	if !ok || state == nil {
+		return nil, false
+	}
+	copy := *state
+	return &copy, true
+}
+
+// SetFileReadState stores a value snapshot. A nil map preserves the legacy
+// disabled-cache behavior. The lock covers map access only.
+func (c *ToolUseContext) SetFileReadState(path string, state *FileReadState) {
+	if c == nil || state == nil {
+		return
+	}
+	if c.ReadFileStateMu != nil {
+		c.ReadFileStateMu.Lock()
+		defer c.ReadFileStateMu.Unlock()
+	}
+	if c.ReadFileState == nil {
+		return
+	}
+	copy := *state
+	c.ReadFileState[path] = &copy
 }
 
 // FileReadState tracks when a file was last read.
