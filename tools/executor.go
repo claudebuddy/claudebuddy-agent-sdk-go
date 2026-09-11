@@ -7,6 +7,8 @@ import (
 	"github.com/claudebuddy/claudebuddy-agent-sdk-go/types"
 )
 
+const defaultExecutorMaxConcurrency = 10
+
 // ToolCallRequest represents a pending tool call.
 type ToolCallRequest struct {
 	ToolUseID string
@@ -23,77 +25,152 @@ type ToolCallResponse struct {
 
 // Executor runs tool calls with concurrency management.
 type Executor struct {
-	registry   *Registry
-	canUseTool types.CanUseToolFn
-	toolCtx    *types.ToolUseContext
+	registry       *Registry
+	canUseTool     types.CanUseToolFn
+	toolCtx        *types.ToolUseContext
+	maxConcurrency int
+}
+
+// ExecutorOptions configures a tool executor.
+type ExecutorOptions struct {
+	Registry       *Registry
+	CanUseTool     types.CanUseToolFn
+	ToolContext    *types.ToolUseContext
+	MaxConcurrency int
 }
 
 // NewExecutor creates a new tool executor.
 func NewExecutor(registry *Registry, canUseTool types.CanUseToolFn, toolCtx *types.ToolUseContext) *Executor {
+	return NewExecutorWithOptions(ExecutorOptions{
+		Registry:    registry,
+		CanUseTool:  canUseTool,
+		ToolContext: toolCtx,
+	})
+}
+
+// NewExecutorWithOptions creates a tool executor with explicit options.
+func NewExecutorWithOptions(opts ExecutorOptions) *Executor {
+	maxConcurrency := opts.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = defaultExecutorMaxConcurrency
+	}
 	return &Executor{
-		registry:   registry,
-		canUseTool: canUseTool,
-		toolCtx:    toolCtx,
+		registry:       opts.Registry,
+		canUseTool:     opts.CanUseTool,
+		toolCtx:        opts.ToolContext,
+		maxConcurrency: maxConcurrency,
 	}
 }
 
-// RunTools executes a batch of tool calls, partitioning into concurrent
-// and sequential groups based on tool properties.
+// RunTools executes a batch of tool calls in request order. Only contiguous
+// ranges of read-only, concurrency-safe tools execute in parallel.
 func (e *Executor) RunTools(ctx context.Context, calls []ToolCallRequest) []ToolCallResponse {
 	if len(calls) == 0 {
 		return nil
 	}
 
-	// Partition into concurrent-safe and sequential groups
-	var concurrent []ToolCallRequest
-	var sequential []ToolCallRequest
-
-	for _, call := range calls {
-		tool := e.registry.Get(call.ToolName)
-		if tool == nil {
-			sequential = append(sequential, call)
+	results := make([]ToolCallResponse, len(calls))
+	for start := 0; start < len(calls); {
+		if !e.isParallelRead(calls[start]) {
+			results[start] = e.runSingle(ctx, calls[start])
+			start++
 			continue
 		}
-		if tool.IsConcurrencySafe(call.Input) {
-			concurrent = append(concurrent, call)
-		} else {
-			sequential = append(sequential, call)
+
+		end := start
+		for end < len(calls) && e.isParallelRead(calls[end]) {
+			end++
 		}
-	}
-
-	var results []ToolCallResponse
-
-	// Run concurrent tools in parallel
-	if len(concurrent) > 0 {
-		results = append(results, e.runConcurrent(ctx, concurrent)...)
-	}
-
-	// Run sequential tools one at a time
-	for _, call := range sequential {
-		result := e.runSingle(ctx, call)
-		results = append(results, result)
+		e.runParallelRange(ctx, calls, results, start, end)
+		start = end
 	}
 
 	return results
 }
 
-func (e *Executor) runConcurrent(ctx context.Context, calls []ToolCallRequest) []ToolCallResponse {
-	results := make([]ToolCallResponse, len(calls))
+func (e *Executor) isParallelRead(call ToolCallRequest) bool {
+	tool := e.registry.Get(call.ToolName)
+	return tool != nil && tool.IsReadOnly(call.Input) && tool.IsConcurrencySafe(call.Input)
+}
+
+func (e *Executor) runParallelRange(
+	ctx context.Context,
+	calls []ToolCallRequest,
+	results []ToolCallResponse,
+	start int,
+	end int,
+) {
+	slots := make(chan struct{}, e.maxConcurrency)
 	var wg sync.WaitGroup
 
-	for i, call := range calls {
+	for i := start; i < end; i++ {
+		if err := ctx.Err(); err != nil {
+			fillCancellationResults(results, calls, i, end, err)
+			break
+		}
+
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			fillCancellationResults(results, calls, i, end, ctx.Err())
+			wg.Wait()
+			return
+		}
+
+		if err := ctx.Err(); err != nil {
+			<-slots
+			fillCancellationResults(results, calls, i, end, err)
+			break
+		}
+
 		wg.Add(1)
-		go func(idx int, c ToolCallRequest) {
+		go func(index int) {
 			defer wg.Done()
-			results[idx] = e.runSingle(ctx, c)
-		}(i, call)
+			defer func() { <-slots }()
+
+			if err := ctx.Err(); err != nil {
+				results[index] = cancellationResponse(calls[index], err)
+				return
+			}
+			results[index] = e.runSingle(ctx, calls[index])
+		}(i)
 	}
 
 	wg.Wait()
-	return results
+}
+
+func fillCancellationResults(
+	results []ToolCallResponse,
+	calls []ToolCallRequest,
+	start int,
+	end int,
+	err error,
+) {
+	for i := start; i < end; i++ {
+		results[i] = cancellationResponse(calls[i], err)
+	}
+}
+
+func cancellationResponse(call ToolCallRequest, err error) ToolCallResponse {
+	return ToolCallResponse{
+		ToolUseID: call.ToolUseID,
+		Result: &types.ToolResult{
+			IsError: true,
+			Error:   err.Error(),
+			Content: []types.ContentBlock{{
+				Type: types.ContentBlockText,
+				Text: "Error: " + err.Error(),
+			}},
+		},
+		Error: err,
+	}
 }
 
 func (e *Executor) runSingle(ctx context.Context, call ToolCallRequest) ToolCallResponse {
+	if err := ctx.Err(); err != nil {
+		return cancellationResponse(call, err)
+	}
+
 	tool := e.registry.Get(call.ToolName)
 	if tool == nil {
 		return ToolCallResponse{
@@ -145,6 +222,9 @@ func (e *Executor) runSingle(ctx context.Context, call ToolCallRequest) ToolCall
 	}
 
 	// Execute tool
+	if err := ctx.Err(); err != nil {
+		return cancellationResponse(call, err)
+	}
 	result, err := tool.Call(ctx, call.Input, e.toolCtx)
 	if err != nil {
 		return ToolCallResponse{
