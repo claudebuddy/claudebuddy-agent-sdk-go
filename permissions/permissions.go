@@ -283,11 +283,9 @@ func deny(reason string) *types.PermissionDecision {
 
 // matchesRule checks if a rule matches the tool and input.
 func matchesRule(rule Rule, toolName string, input map[string]interface{}) bool {
-	if rule.ToolName != toolName {
-		// Check for MCP prefix matching
-		if !strings.HasPrefix(toolName, rule.ToolName) {
-			return false
-		}
+	if rule.ToolName != toolName &&
+		(!strings.HasPrefix(rule.ToolName, "mcp__") || !strings.HasPrefix(toolName, rule.ToolName+"__")) {
+		return false
 	}
 
 	if rule.Pattern == "" {
@@ -306,7 +304,7 @@ func matchesRule(rule Rule, toolName string, input map[string]interface{}) bool 
 	case "Grep":
 		value, _ = input["pattern"].(string)
 	default:
-		return true
+		return false
 	}
 
 	return simpleWildcardMatch(rule.Pattern, value)

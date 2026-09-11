@@ -176,6 +176,8 @@ type Agent struct {
 // New creates a new Agent.
 func New(opts Options) *Agent {
 	resolveEnvOptions(&opts)
+	opts.AllowedTools = cloneStringSlice(opts.AllowedTools)
+	opts.DisallowedTools = cloneStringSlice(opts.DisallowedTools)
 	initErr := opts.Validate()
 
 	sessionID := uuid.New().String()
@@ -388,18 +390,25 @@ func (a *Agent) spawnSubagent(ctx context.Context, config tools.SubagentConfig) 
 	if model == "" {
 		model = a.opts.Model
 	}
+	var childDeniedTools []string
+	if definition, ok := a.opts.Agents[config.Name]; ok {
+		childDeniedTools = definition.DisallowedTools
+	}
 
 	childOpts := Options{
-		Model:          model,
-		APIKey:         a.opts.APIKey,
-		BaseURL:        a.opts.BaseURL,
-		CWD:            config.CWD,
-		MaxTurns:       30,
-		PermissionMode: a.opts.PermissionMode,
-		SystemPrompt:   config.SystemPrompt,
-		CustomHeaders:  a.opts.CustomHeaders,
-		ProxyURL:       a.opts.ProxyURL,
-		TimeoutMs:      a.opts.TimeoutMs,
+		ProviderClient:  a.provider,
+		Model:           model,
+		APIKey:          a.opts.APIKey,
+		BaseURL:         a.opts.BaseURL,
+		CWD:             config.CWD,
+		MaxTurns:        30,
+		PermissionMode:  a.opts.PermissionMode,
+		AllowedTools:    intersectToolBounds(a.opts.AllowedTools, config.Tools),
+		DisallowedTools: unionToolBounds(a.opts.DisallowedTools, childDeniedTools),
+		SystemPrompt:    config.SystemPrompt,
+		CustomHeaders:   a.opts.CustomHeaders,
+		ProxyURL:        a.opts.ProxyURL,
+		TimeoutMs:       a.opts.TimeoutMs,
 	}
 
 	if childOpts.CWD == "" {
@@ -493,4 +502,53 @@ func resolveEnvOptions(opts *Options) {
 	if opts.MaxTurns == 0 {
 		opts.MaxTurns = defaultMaxTurns
 	}
+}
+
+func cloneStringSlice(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func intersectToolBounds(parent, child []string) []string {
+	if parent == nil {
+		return cloneStringSlice(child)
+	}
+	if child == nil {
+		return cloneStringSlice(parent)
+	}
+
+	childSet := make(map[string]bool, len(child))
+	for _, name := range child {
+		childSet[name] = true
+	}
+	intersection := make([]string, 0)
+	for _, name := range parent {
+		if childSet[name] {
+			intersection = append(intersection, name)
+		}
+	}
+	return intersection
+}
+
+func unionToolBounds(parent, child []string) []string {
+	if parent == nil && child == nil {
+		return nil
+	}
+
+	union := make([]string, 0, len(parent)+len(child))
+	seen := make(map[string]bool, len(parent)+len(child))
+	for _, bounds := range [][]string{parent, child} {
+		for _, name := range bounds {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			union = append(union, name)
+		}
+	}
+	return union
 }

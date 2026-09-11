@@ -16,9 +16,10 @@ import (
 )
 
 type fakeTool struct {
-	name     string
-	readOnly bool
-	called   *atomic.Bool
+	name       string
+	readOnly   bool
+	readOnlyFn func(map[string]interface{}) bool
+	called     *atomic.Bool
 }
 
 func (t *fakeTool) Name() string        { return t.name }
@@ -33,7 +34,12 @@ func (t *fakeTool) Call(context.Context, map[string]interface{}, *types.ToolUseC
 	return &types.ToolResult{}, nil
 }
 func (t *fakeTool) IsConcurrencySafe(map[string]interface{}) bool { return t.readOnly }
-func (t *fakeTool) IsReadOnly(map[string]interface{}) bool        { return t.readOnly }
+func (t *fakeTool) IsReadOnly(input map[string]interface{}) bool {
+	if t.readOnlyFn != nil {
+		return t.readOnlyFn(input)
+	}
+	return t.readOnly
+}
 
 func TestPermissionModesDoNotSilentlyAllowMutations(t *testing.T) {
 	tests := []struct {
@@ -179,6 +185,146 @@ func TestDynamicRulesRemainSupportedWithMCPPrefixes(t *testing.T) {
 	}
 }
 
+func TestDynamicRulesDoNotMatchNameCollisions(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *permissions.Config
+		tool   string
+		want   types.PermissionBehavior
+	}{
+		{
+			name: "ordinary allow is exact",
+			config: &permissions.Config{
+				Mode:       types.PermissionModeDefault,
+				AllowRules: []permissions.Rule{{ToolName: "Bash"}},
+			},
+			tool: "BashEvil",
+			want: types.PermissionDeny,
+		},
+		{
+			name: "ordinary deny is exact",
+			config: &permissions.Config{
+				Mode:      types.PermissionModeBypassPermissions,
+				DenyRules: []permissions.Rule{{ToolName: "Bash"}},
+			},
+			tool: "BashEvil",
+			want: types.PermissionAllow,
+		},
+		{
+			name: "MCP allow requires namespace boundary",
+			config: &permissions.Config{
+				Mode:       types.PermissionModeDefault,
+				AllowRules: []permissions.Rule{{ToolName: "mcp__github"}},
+			},
+			tool: "mcp__github_evil__write",
+			want: types.PermissionDeny,
+		},
+		{
+			name: "MCP deny requires namespace boundary",
+			config: &permissions.Config{
+				Mode:      types.PermissionModeBypassPermissions,
+				DenyRules: []permissions.Rule{{ToolName: "mcp__github"}},
+			},
+			tool: "mcp__github_evil__write",
+			want: types.PermissionAllow,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := permissions.NewPolicy(tt.config, nil, nil, nil)
+			got, err := policy(&fakeTool{name: tt.tool}, nil)
+			if err != nil || got.Behavior != tt.want {
+				t.Fatalf("got=%+v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestDynamicMCPRuleDoesNotIgnorePattern(t *testing.T) {
+	policy := permissions.NewPolicy(&permissions.Config{
+		Mode: types.PermissionModeDefault,
+		AllowRules: []permissions.Rule{{
+			ToolName: "mcp__github",
+			Pattern:  "safe*",
+		}},
+	}, nil, nil, nil)
+
+	got, err := policy(&fakeTool{name: "mcp__github__write"}, map[string]interface{}{"command": "unsafe"})
+	if err != nil || got.Behavior != types.PermissionDeny {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+}
+
+func TestCallbackUpdatedInputCannotWidenPlanRestriction(t *testing.T) {
+	var callbackCalled atomic.Bool
+	var toolCalled atomic.Bool
+	inputSensitive := &fakeTool{
+		name: "InputSensitive",
+		readOnlyFn: func(input map[string]interface{}) bool {
+			return input["operation"] == "read"
+		},
+		called: &toolCalled,
+	}
+	policy := permissions.NewPolicy(
+		&permissions.Config{Mode: types.PermissionModePlan},
+		nil,
+		nil,
+		func(types.Tool, map[string]interface{}) (*types.PermissionDecision, error) {
+			callbackCalled.Store(true)
+			return &types.PermissionDecision{
+				Behavior:     types.PermissionAllow,
+				UpdatedInput: map[string]interface{}{"operation": "write"},
+			}, nil
+		},
+	)
+	registry := tools.NewRegistry()
+	registry.Register(inputSensitive)
+	executor := tools.NewExecutor(registry, policy, nil)
+
+	result := executor.RunTools(context.Background(), []tools.ToolCallRequest{{
+		ToolUseID: "call-1",
+		ToolName:  inputSensitive.Name(),
+		Input:     map[string]interface{}{"operation": "read"},
+	}})
+	if !callbackCalled.Load() || toolCalled.Load() || len(result) != 1 || !result[0].Result.IsError {
+		t.Fatalf("callbackCalled=%v toolCalled=%v result=%+v", callbackCalled.Load(), toolCalled.Load(), result)
+	}
+}
+
+func TestCallbackUpdatedInputIsRecheckedAgainstDynamicDeny(t *testing.T) {
+	var callbackCalled atomic.Bool
+	var toolCalled atomic.Bool
+	bash := &fakeTool{name: "Bash", readOnly: true, called: &toolCalled}
+	policy := permissions.NewPolicy(
+		&permissions.Config{
+			Mode:      types.PermissionModeDefault,
+			DenyRules: []permissions.Rule{{ToolName: "Bash", Pattern: "rm *"}},
+		},
+		nil,
+		nil,
+		func(types.Tool, map[string]interface{}) (*types.PermissionDecision, error) {
+			callbackCalled.Store(true)
+			return &types.PermissionDecision{
+				Behavior:     types.PermissionAllow,
+				UpdatedInput: map[string]interface{}{"command": "rm -rf /tmp/not-run"},
+			}, nil
+		},
+	)
+	registry := tools.NewRegistry()
+	registry.Register(bash)
+	executor := tools.NewExecutor(registry, policy, nil)
+
+	result := executor.RunTools(context.Background(), []tools.ToolCallRequest{{
+		ToolUseID: "call-1",
+		ToolName:  bash.Name(),
+		Input:     map[string]interface{}{"command": "pwd"},
+	}})
+	if !callbackCalled.Load() || toolCalled.Load() || len(result) != 1 || !result[0].Result.IsError {
+		t.Fatalf("callbackCalled=%v toolCalled=%v result=%+v", callbackCalled.Load(), toolCalled.Load(), result)
+	}
+}
+
 func TestPolicyDoesNotHoldConfigLockAcrossCallback(t *testing.T) {
 	config := &permissions.Config{Mode: types.PermissionModeDefault}
 	policy := permissions.NewPolicy(config, nil, nil, func(types.Tool, map[string]interface{}) (*types.PermissionDecision, error) {
@@ -251,6 +397,93 @@ func TestAgentComposesCallbackWithPlanBounds(t *testing.T) {
 	}
 }
 
+func TestAgentFreezesStaticBoundsAtConstruction(t *testing.T) {
+	allowed := []string{"Read"}
+	denied := []string{"Bash"}
+	provider := &scriptedProvider{}
+	a := agent.New(agent.Options{
+		ProviderClient:  provider,
+		AllowedTools:    allowed,
+		DisallowedTools: denied,
+		PermissionMode:  types.PermissionModeBypassPermissions,
+		MaxTurns:        1,
+		SystemPrompt:    "test",
+		SettingSources:  []string{},
+	})
+	defer a.Close()
+
+	allowed[0] = "Bash"
+	denied[0] = "Read"
+	if _, err := a.Prompt(context.Background(), "inspect bounds"); err != nil {
+		t.Fatal(err)
+	}
+	if !provider.sawTool("Read") || provider.sawTool("Bash") {
+		t.Fatalf("model-visible tools changed after caller slice mutation: %v", provider.allToolNames())
+	}
+}
+
+func TestChildAgentInheritsParentAndChildDenyBoundsInBypassMode(t *testing.T) {
+	provider := newChildBoundsProvider([]string{"Bash", "Read"})
+	a := agent.New(agent.Options{
+		ProviderClient:  provider,
+		BaseURL:         "://invalid",
+		APIKey:          "test",
+		DisallowedTools: []string{"Bash"},
+		PermissionMode:  types.PermissionModeBypassPermissions,
+		MaxTurns:        2,
+		SystemPrompt:    "test",
+		SettingSources:  []string{},
+		Agents: map[string]agent.AgentDefinition{
+			"restricted": {DisallowedTools: []string{"Read"}},
+		},
+	})
+	defer a.Close()
+
+	if _, err := a.Prompt(context.Background(), "delegate"); err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.childRequestCount(); got != 2 {
+		t.Fatalf("child provider requests=%d, want 2; prompts=%v", got, provider.requestPrompts())
+	}
+	if provider.childSawTool("Bash") || provider.childSawTool("Read") {
+		t.Fatalf("child schemas escaped deny union: %v", provider.childToolNames())
+	}
+	if got := provider.childDeniedToolResults(); got != 2 {
+		t.Fatalf("child denied results=%d, want 2", got)
+	}
+}
+
+func TestChildAgentIntersectsParentAllowBoundWithChildTools(t *testing.T) {
+	provider := newChildBoundsProvider([]string{"Bash"})
+	a := agent.New(agent.Options{
+		ProviderClient: provider,
+		BaseURL:        "://invalid",
+		APIKey:         "test",
+		AllowedTools:   []string{"Agent", "Read"},
+		PermissionMode: types.PermissionModeBypassPermissions,
+		MaxTurns:       2,
+		SystemPrompt:   "test",
+		SettingSources: []string{},
+		Agents: map[string]agent.AgentDefinition{
+			"restricted": {Tools: []string{"Read", "Bash"}},
+		},
+	})
+	defer a.Close()
+
+	if _, err := a.Prompt(context.Background(), "delegate"); err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.childRequestCount(); got != 2 {
+		t.Fatalf("child provider requests=%d, want 2; prompts=%v", got, provider.requestPrompts())
+	}
+	if !provider.childSawTool("Read") || provider.childSawTool("Bash") {
+		t.Fatalf("child schemas did not preserve allow intersection: %v", provider.childToolNames())
+	}
+	if got := provider.childDeniedToolResults(); got != 1 {
+		t.Fatalf("child denied results=%d, want 1", got)
+	}
+}
+
 type scriptedProvider struct {
 	mu       sync.Mutex
 	requests []api.MessagesRequest
@@ -299,6 +532,176 @@ func (p *scriptedProvider) sawTool(name string) bool {
 		}
 	}
 	return false
+}
+
+func (p *scriptedProvider) allToolNames() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var names []string
+	for _, req := range p.requests {
+		for _, tool := range req.Tools {
+			names = append(names, tool.Name)
+		}
+	}
+	return names
+}
+
+type childBoundsProvider struct {
+	mu             sync.Mutex
+	requests       []api.MessagesRequest
+	callsByPrompt  map[string]int
+	childToolCalls []string
+}
+
+func newChildBoundsProvider(childToolCalls []string) *childBoundsProvider {
+	return &childBoundsProvider{
+		callsByPrompt:  make(map[string]int),
+		childToolCalls: append([]string(nil), childToolCalls...),
+	}
+}
+
+func (p *childBoundsProvider) CreateMessage(context.Context, api.MessagesRequest) (*api.StreamMessage, error) {
+	return nil, errors.New("unexpected non-streaming request")
+}
+
+func (p *childBoundsProvider) CreateMessageStream(_ context.Context, req api.MessagesRequest) (<-chan api.StreamEvent, <-chan error) {
+	prompt := firstUserText(req)
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	p.callsByPrompt[prompt]++
+	call := p.callsByPrompt[prompt]
+	p.mu.Unlock()
+
+	var content []types.ContentBlock
+	stopReason := "end_turn"
+	switch {
+	case prompt == "delegate" && call == 1:
+		content = []types.ContentBlock{{
+			Type: types.ContentBlockToolUse,
+			ID:   "parent-agent-call",
+			Name: "Agent",
+			Input: map[string]interface{}{
+				"prompt":        "child task",
+				"description":   "permission child",
+				"subagent_type": "restricted",
+			},
+		}}
+		stopReason = "tool_use"
+	case prompt == "child task" && call == 1:
+		content = make([]types.ContentBlock, len(p.childToolCalls))
+		for i, name := range p.childToolCalls {
+			input := map[string]interface{}{}
+			if name == "Bash" {
+				input["command"] = "true"
+			}
+			if name == "Read" {
+				input["file_path"] = "go.mod"
+			}
+			content[i] = types.ContentBlock{
+				Type:  types.ContentBlockToolUse,
+				ID:    "child-call-" + name,
+				Name:  name,
+				Input: input,
+			}
+		}
+		stopReason = "tool_use"
+	default:
+		content = []types.ContentBlock{{Type: types.ContentBlockText, Text: "done"}}
+	}
+
+	events := make(chan api.StreamEvent, len(content)+2)
+	errs := make(chan error, 1)
+	events <- api.StreamEvent{Type: "message_start", Message: &api.StreamMessage{Role: "assistant", Model: req.Model}}
+	for i := range content {
+		block := content[i]
+		events <- api.StreamEvent{Type: "content_block_start", Index: i, ContentBlock: &block}
+	}
+	events <- api.StreamEvent{Type: "message_delta", Delta: map[string]interface{}{"stop_reason": stopReason}}
+	close(events)
+	return events, errs
+}
+
+func (p *childBoundsProvider) childRequestCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.callsByPrompt["child task"]
+}
+
+func (p *childBoundsProvider) requestPrompts() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	prompts := make([]string, len(p.requests))
+	for i := range p.requests {
+		prompts[i] = firstUserText(p.requests[i])
+	}
+	return prompts
+}
+
+func (p *childBoundsProvider) childSawTool(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, req := range p.requests {
+		if firstUserText(req) != "child task" {
+			continue
+		}
+		for _, tool := range req.Tools {
+			if tool.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (p *childBoundsProvider) childToolNames() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var names []string
+	for _, req := range p.requests {
+		if firstUserText(req) != "child task" {
+			continue
+		}
+		for _, tool := range req.Tools {
+			names = append(names, tool.Name)
+		}
+	}
+	return names
+}
+
+func (p *childBoundsProvider) childDeniedToolResults() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, req := range p.requests {
+		if firstUserText(req) != "child task" || p.callsByPrompt["child task"] < 2 {
+			continue
+		}
+		denied := 0
+		for _, msg := range req.Messages {
+			for _, block := range msg.Content {
+				if block.Type == types.ContentBlockToolResult && block.IsError {
+					denied++
+				}
+			}
+		}
+		if denied > 0 {
+			return denied
+		}
+	}
+	return 0
+}
+
+func firstUserText(req api.MessagesRequest) string {
+	for _, msg := range req.Messages {
+		if msg.Role != "user" {
+			continue
+		}
+		for _, block := range msg.Content {
+			if block.Type == types.ContentBlockText {
+				return block.Text
+			}
+		}
+	}
+	return ""
 }
 
 func toolNames(in []types.Tool) []string {
