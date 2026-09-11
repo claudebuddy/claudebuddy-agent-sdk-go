@@ -44,6 +44,15 @@ func (t *executorTestTool) IsConcurrencySafe(map[string]interface{}) bool {
 
 func (t *executorTestTool) IsReadOnly(map[string]interface{}) bool { return t.readOnly }
 
+type dynamicSafetyExecutorTestTool struct {
+	*executorTestTool
+	readOnlyChecks atomic.Int32
+}
+
+func (t *dynamicSafetyExecutorTestTool) IsReadOnly(map[string]interface{}) bool {
+	return t.readOnlyChecks.Add(1)%2 == 1
+}
+
 func TestExecutorPreservesMutationBarriers(t *testing.T) {
 	var mu sync.Mutex
 	var order []string
@@ -115,6 +124,42 @@ func TestExecutorBoundsAdjacentSafeReads(t *testing.T) {
 	assertExecutorBound(t, 2, 3, func(reg *Registry) *Executor {
 		return NewExecutorWithOptions(ExecutorOptions{Registry: reg, MaxConcurrency: 2})
 	})
+}
+
+func TestExecutorDynamicSafetyPredicateAdvancesScan(t *testing.T) {
+	var calls atomic.Int32
+	tool := &dynamicSafetyExecutorTestTool{executorTestTool: &executorTestTool{
+		name:       "dynamic-read",
+		concurrent: true,
+		call: func(context.Context) (*types.ToolResult, error) {
+			calls.Add(1)
+			return &types.ToolResult{}, nil
+		},
+	}}
+	reg := NewRegistry()
+	reg.Register(tool)
+	ex := NewExecutorWithOptions(ExecutorOptions{Registry: reg, MaxConcurrency: 1})
+	done := make(chan []ToolCallResponse, 1)
+	go func() {
+		done <- ex.RunTools(context.Background(), []ToolCallRequest{{
+			ToolUseID: "dynamic-1",
+			ToolName:  "dynamic-read",
+		}})
+	}()
+
+	results := waitForResults(t, done)
+	if len(results) != 1 || results[0].ToolUseID != "dynamic-1" {
+		t.Fatalf("results=%+v, want one paired result", results)
+	}
+	if results[0].Result == nil || results[0].Result.IsError {
+		t.Fatalf("result=%+v, want successful tool result", results[0].Result)
+	}
+	if got := tool.readOnlyChecks.Load(); got != 1 {
+		t.Fatalf("read-only predicate evaluated %d times, want 1", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("Call invoked %d times, want 1", got)
+	}
 }
 
 func TestExecutorBoundsDefaultConcurrency(t *testing.T) {

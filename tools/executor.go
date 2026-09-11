@@ -77,7 +77,7 @@ func (e *Executor) RunTools(ctx context.Context, calls []ToolCallRequest) []Tool
 			continue
 		}
 
-		end := start
+		end := start + 1
 		for end < len(calls) && e.isParallelRead(calls[end]) {
 			end++
 		}
