@@ -484,6 +484,52 @@ func TestChildAgentIntersectsParentAllowBoundWithChildTools(t *testing.T) {
 	}
 }
 
+func TestChildAgentFreezesNestedPermissionBoundsAtConstruction(t *testing.T) {
+	childTools := []string{"Read"}
+	childDenies := []string{"Bash"}
+	definitions := map[string]agent.AgentDefinition{
+		"restricted": {
+			Tools:           childTools,
+			DisallowedTools: childDenies,
+		},
+	}
+	provider := newChildBoundsProvider([]string{"Bash", "Read"})
+	a := agent.New(agent.Options{
+		ProviderClient: provider,
+		BaseURL:        "://invalid",
+		APIKey:         "test",
+		PermissionMode: types.PermissionModeBypassPermissions,
+		MaxTurns:       2,
+		SystemPrompt:   "test",
+		SettingSources: []string{},
+		Agents:         definitions,
+	})
+	defer a.Close()
+
+	childTools[0] = "Bash"
+	childDenies[0] = "Read"
+	definitions["restricted"] = agent.AgentDefinition{
+		Tools:           []string{"Bash"},
+		DisallowedTools: nil,
+	}
+
+	if _, err := a.Prompt(context.Background(), "delegate"); err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.childRequestCount(); got != 2 {
+		t.Fatalf("child provider requests=%d, want 2; prompts=%v", got, provider.requestPrompts())
+	}
+	if !provider.childSawTool("Read") || provider.childSawTool("Bash") {
+		t.Fatalf("child schemas changed after nested option mutation: %v", provider.childToolNames())
+	}
+	if denied, ok := provider.childToolResultIsError("Bash"); !ok || !denied {
+		t.Fatalf("Bash result found=%v denied=%v, want found and denied", ok, denied)
+	}
+	if denied, ok := provider.childToolResultIsError("Read"); !ok || denied {
+		t.Fatalf("Read result found=%v denied=%v, want found and allowed", ok, denied)
+	}
+}
+
 type scriptedProvider struct {
 	mu       sync.Mutex
 	requests []api.MessagesRequest
@@ -595,7 +641,7 @@ func (p *childBoundsProvider) CreateMessageStream(_ context.Context, req api.Mes
 				input["command"] = "true"
 			}
 			if name == "Read" {
-				input["file_path"] = "go.mod"
+				input["file_path"] = "policy_test.go"
 			}
 			content[i] = types.ContentBlock{
 				Type:  types.ContentBlockToolUse,
@@ -688,6 +734,25 @@ func (p *childBoundsProvider) childDeniedToolResults() int {
 		}
 	}
 	return 0
+}
+
+func (p *childBoundsProvider) childToolResultIsError(name string) (bool, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	toolUseID := "child-call-" + name
+	for _, req := range p.requests {
+		if firstUserText(req) != "child task" {
+			continue
+		}
+		for _, msg := range req.Messages {
+			for _, block := range msg.Content {
+				if block.Type == types.ContentBlockToolResult && block.ToolUseID == toolUseID {
+					return block.IsError, true
+				}
+			}
+		}
+	}
+	return false, false
 }
 
 func firstUserText(req api.MessagesRequest) string {

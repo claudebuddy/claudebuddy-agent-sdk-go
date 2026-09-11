@@ -178,6 +178,7 @@ func New(opts Options) *Agent {
 	resolveEnvOptions(&opts)
 	opts.AllowedTools = cloneStringSlice(opts.AllowedTools)
 	opts.DisallowedTools = cloneStringSlice(opts.DisallowedTools)
+	opts.Agents = cloneAgentDefinitions(opts.Agents)
 	initErr := opts.Validate()
 
 	sessionID := uuid.New().String()
@@ -227,7 +228,7 @@ func New(opts Options) *Agent {
 			defs[name] = tools.SubagentDefinition{
 				Description:  def.Description,
 				Instructions: def.Instructions,
-				Tools:        def.Tools,
+				Tools:        cloneStringSlice(def.Tools),
 				Model:        def.Model,
 			}
 		}
@@ -510,6 +511,46 @@ func cloneStringSlice(values []string) []string {
 	}
 	cloned := make([]string, len(values))
 	copy(cloned, values)
+	return cloned
+}
+
+func cloneAgentDefinitions(definitions map[string]AgentDefinition) map[string]AgentDefinition {
+	if definitions == nil {
+		return nil
+	}
+	cloned := make(map[string]AgentDefinition, len(definitions))
+	for name, definition := range definitions {
+		definition.Tools = cloneStringSlice(definition.Tools)
+		definition.DisallowedTools = cloneStringSlice(definition.DisallowedTools)
+		definition.Skills = cloneStringSlice(definition.Skills)
+		definition.MCPServers = cloneMCPServerConfigs(definition.MCPServers)
+		cloned[name] = definition
+	}
+	return cloned
+}
+
+func cloneMCPServerConfigs(configs map[string]types.MCPServerConfig) map[string]types.MCPServerConfig {
+	if configs == nil {
+		return nil
+	}
+	cloned := make(map[string]types.MCPServerConfig, len(configs))
+	for name, config := range configs {
+		config.Args = cloneStringSlice(config.Args)
+		config.Env = cloneStringMap(config.Env)
+		config.Headers = cloneStringMap(config.Headers)
+		cloned[name] = config
+	}
+	return cloned
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
 	return cloned
 }
 
